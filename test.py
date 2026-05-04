@@ -1,27 +1,82 @@
+import json
 from pathlib import Path
 
-MODEL_DIR = Path("output/models/gemma_3_1b_pt_optimum")
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-pte_files = list(MODEL_DIR.glob("*.pte"))
+from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+    XnnpackPartitioner,
+)
+from executorch.exir import to_edge_transform_and_lower
+from executorch.exir.capture._config import EdgeCompileConfig
 
-if not pte_files:
-    raise FileNotFoundError(f"No .pte files found in {MODEL_DIR}")
 
-print("ExecuTorch Runtime Validation")
-print("-" * 40)
+def main():
+    config_path = Path("export/configs/llm/config_gemma_3_1b_pt_optimum.json")
 
-for file in pte_files:
-    size_mb = round(file.stat().st_size / (1024 * 1024), 2)
+    with config_path.open() as f:
+        cfg = json.load(f)
 
-    print(f"Artifact Found: {file.name}")
-    print(f"Path: {file}")
-    print(f"Size: {size_mb} MB")
+    model_id = cfg["model_id"]
+    output_dir = Path(cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if size_mb < 100:
-        print("WARNING: suspiciously small artifact")
-    else:
-        print("PASS: artifact size looks valid")
+    print(f"Loading model from: {model_id}")
 
-print("-" * 40)
-print("Portable .pte validation complete.")
-print("Next step: runtime execution on target backend.")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype=torch.float32,
+    ).eval()
+
+    # Disable KV cache so torch.export does not encounter DynamicCache.
+    model.config.use_cache = False
+
+    prompt = cfg.get(
+        "prompt",
+        "The reason the sky appears blue is",
+    )
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=32,
+    )
+
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    print("Exporting simplified forward pass...")
+
+    ep = torch.export.export(
+        model,
+        args=(input_ids, attention_mask),
+        strict=False,
+    )
+
+    print("Lowering to Edge + XNNPACK...")
+
+    edge = to_edge_transform_and_lower(
+        ep,
+        partitioner=[XnnpackPartitioner()],
+        compile_config=EdgeCompileConfig(
+            _check_ir_validity=True,
+        ),
+    )
+
+    print("Creating XNNPACK .pte file...")
+
+    et_program = edge.to_executorch()
+
+    output_file = output_dir / "gemma_3_1b_pt_xnnpack_fp32.pte"
+
+    with open(output_file, "wb") as f:
+        f.write(et_program.buffer)
+
+    print(f"SUCCESS: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
