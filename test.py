@@ -10,7 +10,7 @@ from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
 from executorch.exir import to_edge_transform_and_lower
 from executorch.exir.capture._config import EdgeCompileConfig
 
-from torchao.quantization import quantize_, int8_weight_only
+from torchao.quantization import quantize_, Int8WeightOnlyConfig
 
 
 def main():
@@ -32,10 +32,15 @@ def main():
         dtype=torch.float32,
     ).eval()
 
-    print("Applying INT8 weight-only quantization...")
-
+    # Required for torch.export compatibility.
     model.config.use_cache = False
-    quantize_(model, int8_weight_only())
+
+    print("Applying TorchAO INT8 weight-only quantization...")
+
+    quantize_(
+        model,
+        Int8WeightOnlyConfig(),
+    )
 
     prompt = "The reason the sky appears blue is"
 
@@ -49,7 +54,7 @@ def main():
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
 
-    print("Exporting quantized forward pass...")
+    print("Exporting INT8 quantized forward pass...")
 
     ep = torch.export.export(
         model,
@@ -57,7 +62,7 @@ def main():
         strict=False,
     )
 
-    print("Lowering to Edge + XNNPACK...")
+    print("Lowering INT8 model to Edge + XNNPACK...")
 
     edge = to_edge_transform_and_lower(
         ep,
@@ -71,7 +76,7 @@ def main():
 
     et_program = edge.to_executorch()
 
-    output_file = output_dir / "gemma_3_1b_pt_xnnpack_int8.pte"
+    output_file = output_dir / "gemma_3_1b_pt_xnnpack_int8_weight_only.pte"
 
     with open(output_file, "wb") as f:
         f.write(et_program.buffer)
