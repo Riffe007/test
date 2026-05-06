@@ -2,7 +2,7 @@
 “”“dequantize_onnx.py
 
 Fold QuantizeLinear / DequantizeLinear ops in an ONNX graph into FP32
-constants and drop them, producing a quantization-free (“pseudo-float”)
+constants and drop them, producing a quantization-free (pseudo-float)
 ONNX model that downstream tools (notably onnx2torch) can consume.
 
 ## Why this exists
@@ -160,7 +160,7 @@ graph: GraphProto,
 inits: InitializerIndex,
 stats: FoldStats,
 ) -> None:
-“”“Replace `DequantizeLinear(const_int, const_scale, const_zp)` with one FP32 constant.”””
+“”“Replace DequantizeLinear(const_int, const_scale, const_zp) with one FP32 constant.”””
 nodes_to_remove: list[NodeProto] = []
 initializers_to_drop: set[str] = set()
 
@@ -207,7 +207,7 @@ graph: GraphProto,
 inits: InitializerIndex,
 stats: FoldStats,
 ) -> None:
-“”“Rewire `x -> Quantize -> Dequantize -> consumer` to `x -> consumer`.
+“”“Rewire ‘x -> Quantize -> Dequantize -> consumer’ to ‘x -> consumer’.
 
 ```
 We discard the quantization grid intentionally: the framework's
@@ -254,13 +254,13 @@ _drop_orphan_initializers(graph, inits, initializers_to_drop, stats)
 # —————————————————————————
 
 def _resolve_rewire_chains(rewires: dict[str, str]) -> dict[str, str]:
-“”“Collapse `a -> b -> c` chains into `a -> c`.
+“”“Collapse ‘a -> b -> c’ chains into ‘a -> c’.
 
 ```
 Necessary because chained Q/DQ patterns at consecutive layer
 boundaries produce intermediate-tensor rewires whose targets are
 themselves about to be rewritten in the same batch. Without this,
-``_apply_rewires`` would point consumers at tensor names whose
+_apply_rewires would point consumers at tensor names whose
 producers have just been deleted.
 """
 resolved: dict[str, str] = {}
@@ -348,7 +348,7 @@ def fold_quantization(model: ModelProto) -> FoldStats:
 ```
 Folding a constant DequantizeLinear can expose a previously-blocked
 Q -> DQ pair on the next iteration, so we loop until the Q/DQ count
-stops decreasing. ``MAX_ITERS`` guards against any pathological
+stops decreasing. MAX_ITERS guards against any pathological
 no-progress case.
 """
 MAX_ITERS = 8
