@@ -132,7 +132,7 @@ def _build_stages() -> list[Stage]:
         Stage(
             number=3,
             name="ONNX -> PyTorch",
-            script=_SCRIPT_DIR / "convert_onnx_pytorch.py",
+            script=_SCRIPT_DIR / "convert_onnx_to_pytorch.py",
             input_path=_WEIGHTS_DIR / "model.fp32.onnx",
             output_path=_WEIGHTS_DIR / "model.pt",
             description="Convert the FP32 ONNX to PyTorch via onnx2torch and run a forward-pass smoke test.",
