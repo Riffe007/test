@@ -3,10 +3,11 @@
 Order matters:
   1. tf2onnx convert (TFLite -> raw ONNX)
   2. force int graph inputs to FP32
-  3. onnxsim (folds INT8_weight + DQ into FP32 initializers)
-  4. Strip remaining Q/DQ (now activation-only)
-  5. onnxsim again (cleans up identity chains)
-  6. checker + numerical parity vs source TFLite (hard fail on drift)
+  3. replace TFL_edgetpu-custom-op nodes with native ONNX ops
+  4. onnxsim (folds INT8_weight + DQ into FP32 initializers)
+  5. Strip remaining Q/DQ (now activation-only)
+  6. onnxsim again (cleans up identity chains)
+  7. checker + numerical parity vs source TFLite (hard fail on drift)
 """
 
 from pathlib import Path
@@ -69,6 +70,40 @@ def force_fp32_inputs(m, input_shape=None):
                 for d, v in zip(dims, input_shape):
                     d.dim_value = int(v)
                 log.info("  overrode input shape: %s", input_shape)
+    return m
+
+
+def replace_edgetpu_ops(m):
+    """Replace TFL_edgetpu-custom-op nodes with native ONNX ops.
+
+    The EdgeTPU compiler bundles small subgraphs into custom ops carrying
+    binary TPU bytecode that ONNX runtime can't validate. Heuristically map
+    them to native ops based on the node name. The parity check is your
+    validation gate - if shapes/values don't match the source TFLite,
+    inspect the original via Netron and extend NAME_TO_OP."""
+    NAME_TO_OP = [
+        ("squeeze",   "Squeeze"),
+        ("transpose", "Transpose"),
+        ("reshape",   "Reshape"),
+    ]
+    replaced = 0
+    for node in m.graph.node:
+        if not node.op_type.startswith("TFL_"):
+            continue
+        new_op = "Identity"
+        for pat, op in NAME_TO_OP:
+            if pat in node.name.lower():
+                new_op = op
+                break
+        log.info("  replacing %s (was %s) -> %s",
+                 node.name, node.op_type, new_op)
+        node.op_type = new_op
+        node.domain = ""
+        del node.attribute[:]  # purge unparseable binary attrs
+        replaced += 1
+    if replaced:
+        log.warning("  replaced %d EdgeTPU op(s) - parity check is your "
+                    "validation gate", replaced)
     return m
 
 
@@ -204,13 +239,13 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     raw_path = args.output.with_name(args.output.stem + ".raw.onnx")
 
-    # Stage 1: TFLite -> raw ONNX (THIS IS WHAT WAS MISSING)
     convert_tflite_to_onnx(args.input, raw_path)
 
     log.info("loading: %s", raw_path)
     m = onnx.load(str(raw_path))
 
     m = force_fp32_inputs(m, input_shape=args.input_shape)
+    m = replace_edgetpu_ops(m)
 
     # Critical ordering: simplify FIRST so weight DQs fold into FP32
     # initializers. Stripping before this can leave INT8 weights feeding
