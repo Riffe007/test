@@ -1,96 +1,161 @@
 #!/usr/bin/env python3
-"""convert_onnx_pytorch.py
+"""convert_tflite_to_onnx.py
 
-Convert a (Q/DQ-free) ONNX model to a PyTorch .pt file via onnx2torch.
+Convert a TFLite model to ONNX format using tf2onnx.
 
-This is the third stage of the MobileNetV2 conversion pipeline:
+This is the first stage of the MobileNetV2 conversion pipeline:
 
-    1. convert_tflite_to_onnx.py   TFLite (INT8) -> ONNX (with Q/DQ ops)
+    1. convert_tflite_to_onnx.py   TFLite (INT8) -> ONNX (with Q/DQ ops)  <-- this file
     2. dequantize_onnx.py          ONNX with Q/DQ -> ONNX (FP32, Q/DQ-free)
-    3. convert_onnx_pytorch.py     ONNX (FP32)    -> PyTorch .pt   <-- this file
+    3. convert_onnx_pytorch.py     ONNX (FP32)    -> PyTorch .pt
 
-The script expects an ONNX graph that is already free of QuantizeLinear
-and DequantizeLinear ops -- otherwise onnx2torch raises NotImplementedError.
-A pre-flight check at the start of the run surfaces this clearly rather
-than letting it explode three layers deep in onnx2torch.
+This script wraps tf2onnx as a subprocess (the same approach the team
+uses for MobileNetV1) but adds:
 
-After conversion the script does a smoke test: builds a zero-tensor of
-the configured input shape, runs a forward pass in eval / no_grad mode,
-and confirms the model produces output. This catches silent shape
-mismatches between the ONNX input signature and what we expect.
+    * required CLI arguments instead of hardcoded relative paths
+    * exit-code propagation -- a tf2onnx failure exits non-zero rather
+      than printing 'Conversion process completed' regardless
+    * pre-flight checks (input file exists, output dir is writable,
+      tf2onnx is installed in the active interpreter)
+    * post-flight verification (output ONNX exists, parses, has nodes)
 
 Usage
 -----
-    python model_sources/MobileNetV2/scripts/convert_onnx_pytorch.py \\
-        --input  model_sources/MobileNetV2/weights/model.fp32.onnx \\
-        --output model_sources/MobileNetV2/weights/model.pt
+    python model_sources/MobileNetV2/scripts/convert_tflite_to_onnx.py \\
+        --input  model_sources/MobileNetV2/weights/model.tflite \\
+        --output model_sources/MobileNetV2/weights/model.onnx
 
 Exit codes
 ----------
     0  success
-    1  filesystem / load error
-    2  input ONNX still contains Q/DQ ops (run dequantize_onnx.py first)
-    3  onnx2torch conversion raised
-    4  smoke-test forward pass failed
+    1  filesystem / load error (input missing, output dir unwritable, etc.)
+    2  tf2onnx is not installed in the active Python interpreter
+    3  tf2onnx subprocess failed (returned non-zero or timed out)
+    4  output ONNX missing or unparseable after the subprocess returned 0
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
+import subprocess
 import sys
 from pathlib import Path
 
-import onnx
-import torch
-from onnx import ModelProto
-from onnx2torch import convert
+LOG = logging.getLogger("convert_tflite_to_onnx")
 
-LOG = logging.getLogger("convert_onnx_pytorch")
+# Default ONNX opset. tf2onnx supports up to 18 at the time of writing;
+# 16 is a safe middle ground that has broad downstream tool support
+# (onnx2torch, onnxruntime, ExecuTorch). MobileNetV1 in this repo uses 16.
+_DEFAULT_OPSET = 16
 
-_QUANT_OP = "QuantizeLinear"
-_DEQUANT_OP = "DequantizeLinear"
-
-
-# --------------------------------------------------------------------------- #
-# Pre-flight check                                                            #
-# --------------------------------------------------------------------------- #
-
-
-def _count_qdq_ops(model: ModelProto) -> int:
-    return sum(1 for n in model.graph.node if n.op_type in (_QUANT_OP, _DEQUANT_OP))
+# Generous ceiling on the subprocess. tf2onnx is slow on first run
+# (TensorFlow imports + graph rewriting) but should finish well under
+# 5 minutes for any model in this codebase.
+_SUBPROCESS_TIMEOUT_SECONDS = 600
 
 
 # --------------------------------------------------------------------------- #
-# Smoke test                                                                  #
+# Pre-flight                                                                  #
 # --------------------------------------------------------------------------- #
 
 
-def _smoke_test(
-    pytorch_model: torch.nn.Module,
-    input_shape: tuple[int, int, int, int],
-) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Run a single forward pass with zero input to verify the model is callable.
+def _tf2onnx_is_importable() -> bool:
+    """Confirm tf2onnx is importable in the active interpreter.
 
-    The result is returned for shape logging but otherwise discarded.
-    Any exception raised here propagates -- the caller treats that as
-    smoke-test failure.
+    We probe by spawning a subprocess that runs 'import tf2onnx',
+    rather than importing it here directly. Importing tf2onnx in this
+    process would transitively import TensorFlow, which is slow (~5s)
+    and prints spurious warnings -- not something to do just to check
+    availability.
     """
-    pytorch_model.eval()
-    with torch.no_grad():
-        dummy = torch.zeros(*input_shape, dtype=torch.float32)
-        return pytorch_model(dummy)
+    proc = subprocess.run(
+        [sys.executable, "-c", "import tf2onnx"],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
 
 
-def _describe_output(out: object) -> str:
-    """Render a forward-pass output (tensor, tuple, dict, list) as a shape summary."""
-    if isinstance(out, torch.Tensor):
-        return f"Tensor{tuple(out.shape)} dtype={out.dtype}"
-    if isinstance(out, (list, tuple)):
-        return "(" + ", ".join(_describe_output(o) for o in out) + ")"
-    if isinstance(out, dict):
-        return "{" + ", ".join(f"{k}: {_describe_output(v)}" for k, v in out.items()) + "}"
-    return repr(type(out))
+def _is_writable(directory: Path) -> bool:
+    """Probe whether the calling process can create files in the given directory."""
+    return os.access(str(directory), os.W_OK)
+
+
+# --------------------------------------------------------------------------- #
+# Subprocess                                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _run_tf2onnx(
+    tflite_path: Path,
+    onnx_path: Path,
+    opset: int,
+) -> int:
+    """Invoke 'python -m tf2onnx.convert ...'. Returns the subprocess exit code.
+
+    Returns 124 on timeout (matching the GNU 'timeout' command convention).
+    """
+    cmd = [
+        sys.executable,
+        "-m", "tf2onnx.convert",
+        "--opset", str(opset),
+        "--tflite", str(tflite_path),
+        "--output", str(onnx_path),
+    ]
+    LOG.info("running: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(
+            cmd,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        LOG.error("tf2onnx timed out after %d seconds", _SUBPROCESS_TIMEOUT_SECONDS)
+        return 124
+    return proc.returncode
+
+
+# --------------------------------------------------------------------------- #
+# Post-flight                                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _verify_output_onnx(path: Path) -> tuple[bool, str]:
+    """Confirm the produced ONNX file exists, parses, and is non-trivial.
+
+    Returns (ok, message). On success message is a one-line summary
+    (size, node count, initializer count); on failure it is the reason.
+
+    onnx is imported lazily here so that this script remains usable in
+    environments where only tf2onnx (and its TensorFlow dep) is
+    installed -- a degraded but still-functional mode where we skip the
+    deep parse and only check that the file is non-empty.
+    """
+    if not path.is_file():
+        return False, f"expected output ONNX not found: {path}"
+
+    size = path.stat().st_size
+    if size == 0:
+        return False, f"output ONNX is empty: {path}"
+
+    try:
+        import onnx
+    except ImportError:
+        return True, f"output exists ({size:,} bytes) -- onnx not installed, skipped deep parse"
+
+    try:
+        model = onnx.load(str(path))
+    except Exception as e:
+        return False, f"output ONNX failed to parse: {e}"
+
+    n_nodes = len(model.graph.node)
+    n_inits = len(model.graph.initializer)
+    if n_nodes == 0:
+        return False, "output ONNX has zero nodes"
+
+    return True, f"{size:,} bytes, {n_nodes} nodes, {n_inits} initializers"
 
 
 # --------------------------------------------------------------------------- #
@@ -100,32 +165,25 @@ def _describe_output(out: object) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Convert an FP32 ONNX model to a PyTorch .pt file via onnx2torch.",
+        description="Convert a TFLite model to ONNX format using tf2onnx.",
     )
     p.add_argument(
         "--input",
         type=Path,
         required=True,
-        help="Path to the input .onnx file (must be Q/DQ-free).",
+        help="Path to the input .tflite file.",
     )
     p.add_argument(
         "--output",
         type=Path,
         required=True,
-        help="Path to write the output .pt file.",
+        help="Path to write the output .onnx file.",
     )
     p.add_argument(
-        "--input-shape",
-        nargs=4,
+        "--opset",
         type=int,
-        default=[1, 3, 300, 300],
-        metavar=("N", "C", "H", "W"),
-        help="Input tensor shape used for the post-conversion smoke test (NCHW).",
-    )
-    p.add_argument(
-        "--skip-smoke-test",
-        action="store_true",
-        help="Skip the forward-pass smoke test (not recommended).",
+        default=_DEFAULT_OPSET,
+        help=f"ONNX opset version (default: {_DEFAULT_OPSET}).",
     )
     p.add_argument("--verbose", action="store_true", help="Enable DEBUG logging.")
     return p.parse_args(argv)
@@ -141,62 +199,47 @@ def main(argv: list[str] | None = None) -> int:
     input_path = args.input.expanduser().resolve()
     output_path = args.output.expanduser().resolve()
 
+    # Filesystem pre-flight.
     if not input_path.is_file():
         LOG.error("input file not found: %s", input_path)
         return 1
+    if input_path.suffix.lower() != ".tflite":
+        LOG.warning("input does not have .tflite extension: %s", input_path)
 
-    LOG.info("loading: %s", input_path)
+    output_dir = output_path.parent
     try:
-        onnx_model = onnx.load(str(input_path))
-    except Exception as e:
-        LOG.error("failed to load ONNX: %s", e)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        LOG.error("could not create output directory %s: %s", output_dir, e)
+        return 1
+    if not _is_writable(output_dir):
+        LOG.error("output directory is not writable: %s", output_dir)
         return 1
 
-    # Pre-flight: refuse to attempt conversion on a graph that still
-    # contains Q/DQ ops. onnx2torch will raise NotImplementedError on
-    # the first one it sees; we'd rather report it here with a clear
-    # remediation message.
-    n_qdq = _count_qdq_ops(onnx_model)
-    if n_qdq > 0:
+    # tf2onnx pre-flight.
+    if not _tf2onnx_is_importable():
         LOG.error(
-            "input ONNX contains %d QuantizeLinear/DequantizeLinear op(s). "
-            "onnx2torch cannot convert these. Run dequantize_onnx.py first "
-            "to fold Q/DQ pairs into FP32 constants.",
-            n_qdq,
+            "tf2onnx is not installed in %s. Install it with:\n"
+            "    pip install tf2onnx",
+            sys.executable,
         )
         return 2
 
-    LOG.info("converting ONNX -> PyTorch (this may take a moment)...")
-    try:
-        pytorch_model = convert(onnx_model)
-    except Exception as e:
-        LOG.error("onnx2torch conversion failed: %s", e)
+    LOG.info("input:  %s (%s bytes)", input_path, f"{input_path.stat().st_size:,}")
+    LOG.info("output: %s", output_path)
+    LOG.info("opset:  %d", args.opset)
+
+    rc = _run_tf2onnx(input_path, output_path, args.opset)
+    if rc != 0:
+        LOG.error("tf2onnx exited with code %d", rc)
         return 3
 
-    n_params = sum(p.numel() for p in pytorch_model.parameters())
-    LOG.info("conversion complete: %s parameters across %d tensors",
-             f"{n_params:,}",
-             sum(1 for _ in pytorch_model.parameters()))
+    ok, msg = _verify_output_onnx(output_path)
+    if not ok:
+        LOG.error("post-flight check failed: %s", msg)
+        return 4
 
-    if not args.skip_smoke_test:
-        shape = tuple(args.input_shape)
-        LOG.info("smoke test: forward pass with zeros(%s)...", list(shape))
-        try:
-            out = _smoke_test(pytorch_model, shape)  # type: ignore[arg-type]
-        except Exception as e:
-            LOG.error("smoke-test forward pass failed: %s", e)
-            LOG.error(
-                "this usually means the configured input shape %s does not "
-                "match what the converted model expects. Re-check the TFLite "
-                "signature with inspect_tflite_signature.py.",
-                list(shape),
-            )
-            return 4
-        LOG.info("smoke test OK -- output: %s", _describe_output(out))
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(pytorch_model, str(output_path))
-    LOG.info("wrote: %s", output_path)
+    LOG.info("conversion successful: %s", msg)
     return 0
 
 
