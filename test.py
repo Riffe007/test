@@ -1,51 +1,27 @@
-cd /tmp
-rm -rf ssd_mobilenet_v2_coco_2018_03_29  # FP32 tarball doesn't have what we need
-
-[ -f ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03.tar.gz ] || wget -q --show-progress \
-  http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03.tar.gz
-tar xzf ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03.tar.gz
-
-# Confirm tflite_graph.pb is there
-ls -lah /tmp/ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03/tflite_graph.pb
-
 cd ~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2
 
-python3 - <<'PY' 2>&1 | tee /tmp/convert_output.log
-import tensorflow as tf
-import numpy as np
-from pathlib import Path
+# 1. Clone qfgaohao (we need its model definition code)
+mkdir -p tools
+[ -d tools/pytorch-ssd ] || git clone https://github.com/qfgaohao/pytorch-ssd.git tools/pytorch-ssd
 
-src = "/tmp/ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03/tflite_graph.pb"
-out = Path("weights/model.tflite")
-assert Path(src).exists(), f"Missing: {src}"
-out.parent.mkdir(parents=True, exist_ok=True)
+# 2. Download MobileNetV2 SSD-Lite VOC weights
+[ -f weights/mb2-ssd-lite.pth ] || wget -q --show-progress \
+  -O weights/mb2-ssd-lite.pth \
+  https://storage.googleapis.com/models-hao/mb2-ssd-lite-mp-0_686.pth
 
-converter = tf.compat.v1.lite.TFLiteConverter.from_frozen_graph(
-    graph_def_file=src,
-    input_arrays=["normalized_input_image_tensor"],
-    output_arrays=[
-        "TFLite_Detection_PostProcess",
-        "TFLite_Detection_PostProcess:1",
-        "TFLite_Detection_PostProcess:2",
-        "TFLite_Detection_PostProcess:3",
-    ],
-    input_shapes={"normalized_input_image_tensor": [1, 300, 300, 3]},
-)
-converter.allow_custom_ops = True
-converter.inference_type = tf.float32          # explicit FP32
-converter.inference_input_type = tf.float32    # explicit FP32 input
-# NO converter.optimizations -> FakeQuant nodes are stripped, weights stay FP32
+# 3. Test image (canonical COCO val sample — two cats on a couch)
+mkdir -p test_data
+[ -f test_data/test.jpg ] || wget -q -O test_data/test.jpg \
+  https://images.cocodataset.org/val2017/000000039769.jpg
 
-tflite_model = converter.convert()
-out.write_bytes(tflite_model)
+# 4. Labels
+mkdir -p labels
+[ -f labels/coco_labels.txt ] || wget -q -O labels/coco_labels.txt \
+  https://raw.githubusercontent.com/google-coral/test_data/master/coco_labels.txt
+[ -f labels/voc_labels.txt ] || cp tools/pytorch-ssd/models/voc-model-labels.txt labels/voc_labels.txt
 
-interp = tf.lite.Interpreter(model_path=str(out))
-interp.allocate_tensors()
-in_d = interp.get_input_details()[0]
-print(f"\nSaved:        {out}  ({len(tflite_model)/1024/1024:.1f} MB)")
-print(f"Input dtype:  {np.dtype(in_d['dtype']).name}")
-print(f"Input shape:  {in_d['shape'].tolist()}")
-print(f"Quant params: {in_d['quantization']}")
-PY
+# 5. Deps (qfgaohao needs cv2; you should already have torch + tf)
+pip install opencv-python pillow
 
-ls -lah weights/
+# 6. Verify
+ls -lah weights/ test_data/ labels/
