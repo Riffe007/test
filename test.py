@@ -1,192 +1,196 @@
-"""Pipeline orchestrator: TFLite -> PyTorch with formatted stage output.
+#!/usr/bin/env python3
+"""
+MetaExecuTorch model conversion pipeline.
 
 Stages:
-  1. TFLite -> Clean FP32 ONNX
-  2. Clean FP32 ONNX -> PyTorch
+  [1/2] TFLite -> Clean FP32 ONNX
+  [2/2] ONNX   -> PyTorch
+
+Drop in next to tflite_to_clean_fp32_onnx.py and onnx_to_pytorch.py.
 """
 
-from pathlib import Path
+from __future__ import annotations
+
 import argparse
 import subprocess
 import sys
 import time
-
-SCRIPTS = Path(__file__).resolve().parent
-ROOT = SCRIPTS.parent  # MobileNetV2/
-WEIGHTS = ROOT / "weights"
+from dataclasses import dataclass, field
+from pathlib import Path
 
 
-# --- ANSI colors --------------------------------------------------------
+# ---- pretty printing ---------------------------------------------------------
+
 class C:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
+    INFO = "\033[36m"
     OK = "\033[32m"
     FAIL = "\033[31m"
-    INFO = "\033[36m"
     DIM = "\033[2m"
+    RESET = "\033[0m"
 
 
-# --- Stage definitions --------------------------------------------------
-STAGES = [
-    {
-        "num": 1,
-        "title": "TFLite -> Clean FP32 ONNX",
-        "description": (
-            "Convert TFLite, force FP32 inputs, fold weight DQs into "
-            "FP32 initializers, strip activation Q/DQ, simplify, "
-            "parity-check vs source TFLite."
-        ),
-        "script": "tflite_to_clean_fp32_onnx.py",
-        "input": WEIGHTS / "model.tflite",
-        "output": WEIGHTS / "model.fp32.onnx",
-        "runtime_est": "~10-15s",
-    },
-    {
-        "num": 2,
-        "title": "ONNX -> PyTorch",
-        "description": "Convert clean FP32 ONNX to PyTorch via onnx2torch.",
-        "script": "convert_onnx_to_pytorch.py",
-        "input": WEIGHTS / "model.fp32.onnx",
-        "output": WEIGHTS / "model.pt",
-        "runtime_est": "~5-10s",
-    },
-]
+def banner(title: str, width: int = 96) -> None:
+    print("=" * width)
+    print(title)
+    print("=" * width)
 
 
-# --- Output helpers -----------------------------------------------------
-def banner(text="", char="="):
-    print(char * 80)
-    if text:
-        print(text)
-        print(char * 80)
-
-
-def stage_header(stage, total):
-    print()
-    banner()
-    print(f"[{stage['num']}/{total}] {C.BOLD}{stage['title']}{C.RESET}")
-    print(f"{C.DIM}{stage['description']}{C.RESET}")
-    banner()
-
-
-def info_line(label, value):
+def info(label: str, value: str) -> None:
     print(f"  {C.INFO}[info]{C.RESET} {label:<10} {value}")
 
 
-def ok_line(elapsed, summary=""):
-    msg = f"  {C.OK}[ ok ]{C.RESET} stage done in {elapsed:.1f}s"
-    if summary:
-        msg += f" -- {summary}"
-    print(msg)
+def fail(msg: str) -> None:
+    print(f"  {C.FAIL}[fail]{C.RESET} {msg}")
 
 
-def fail_line(elapsed, exit_code, debug_cmd=""):
-    print(f"  {C.FAIL}[fail]{C.RESET} stage failed with exit code "
-          f"{exit_code} after {elapsed:.1f}s")
-    if debug_cmd:
-        print(f"         to debug, re-run with verbose logging:")
-        print(f"           {debug_cmd}")
+# ---- stage definition --------------------------------------------------------
+
+@dataclass
+class Stage:
+    description: str           # e.g. "TFLite -> Clean FP32 ONNX"
+    script: Path               # absolute path to the stage script
+    input_path: Path
+    output_path: Path
+    extra_args: list[str] = field(default_factory=list)
+    runtime_hint: str = ""
+
+    status: str = "PENDING"
+    elapsed: float = 0.0
+
+    def build_cmd(self, verbose: bool) -> list[str]:
+        cmd = [
+            sys.executable, str(self.script),
+            "--input",  str(self.input_path),
+            "--output", str(self.output_path),
+            *self.extra_args,
+        ]
+        if verbose:
+            cmd.append("--verbose")
+        return cmd
 
 
-# --- Stage runner -------------------------------------------------------
-def run_stage(stage, total):
-    stage_header(stage, total)
-    info_line("input:", stage["input"])
-    info_line("output:", stage["output"])
-    info_line("runtime:", stage["runtime_est"])
-    info_line("command:", f"python3 {stage['script']}")
-    print("-" * 80)
+# ---- runner ------------------------------------------------------------------
 
-    start = time.time()
-    try:
-        subprocess.run(
-            [sys.executable, str(SCRIPTS / stage["script"])],
-            check=True,
-            cwd=str(SCRIPTS),
-        )
-    except subprocess.CalledProcessError as e:
-        elapsed = time.time() - start
-        print("-" * 80)
-        fail_line(
-            elapsed, e.returncode,
-            debug_cmd=f"python3 {SCRIPTS / stage['script']}",
-        )
-        return elapsed, "FAIL", ""
+def run_stage(stage: Stage, idx: int, total: int, verbose: bool) -> bool:
+    banner(f"[{idx}/{total}] {stage.description}")
 
-    elapsed = time.time() - start
-    print("-" * 80)
+    cmd = stage.build_cmd(verbose)
 
-    # Summarize output file
-    summary = ""
-    if stage["output"].exists():
-        size_kb = stage["output"].stat().st_size / 1024
-        if size_kb > 1024:
-            summary = f"{stage['output'].name} ({size_kb / 1024:.1f} MB)"
-        else:
-            summary = f"{stage['output'].name} ({size_kb:.1f} KB)"
+    info("input:",   str(stage.input_path))
+    info("output:",  str(stage.output_path))
+    if stage.runtime_hint:
+        info("runtime:", stage.runtime_hint)
+    info("command:", " ".join(cmd))
+    print("-" * 96)
 
-    ok_line(elapsed, summary)
-    return elapsed, "ok", summary
+    t0 = time.perf_counter()
+    result = subprocess.run(cmd)
+    stage.elapsed = time.perf_counter() - t0
+
+    if result.returncode == 0:
+        stage.status = "OK"
+        return True
+
+    stage.status = "FAIL"
+    fail(f"stage failed with exit code {result.returncode} after {stage.elapsed:.1f}s")
+    print("        to debug, re-run with verbose logging:")
+    debug_cmd = stage.build_cmd(verbose=True)
+    print(f"          {' '.join(debug_cmd)}")
+    return False
 
 
-# --- Summary table ------------------------------------------------------
-def print_summary(results, total):
+def print_summary(stages: list[Stage], total_elapsed: float) -> None:
     print()
     banner("Summary")
-    header = f"{'stage':<40} {'status':<7} {'time':<8} {'output'}"
-    print(header)
-    print("-" * len(header))
-
-    total_time = 0.0
-    for stage, (elapsed, status, output) in zip(STAGES, results):
-        title = f"[{stage['num']}/{total}] {stage['title']}"
-        color = C.OK if status == "ok" else (C.FAIL if status == "FAIL" else C.DIM)
-        time_str = f"{elapsed:.1f}s" if elapsed > 0 else "-"
-        print(f"{title:<40} {color}{status:<7}{C.RESET} {time_str:<8} {output}")
-        total_time += elapsed
-
+    print(f"  {'stage':<40} {'status':<8} {'time':<8} output")
+    print("  " + "-" * 90)
+    for s in stages:
+        color = C.OK if s.status == "OK" else (C.FAIL if s.status == "FAIL" else C.DIM)
+        t_str = f"{s.elapsed:.1f}s" if s.elapsed else "-"
+        o_str = str(s.output_path) if s.status == "OK" else "-"
+        print(f"  {s.description:<40} {color}{s.status:<8}{C.RESET} {t_str:<8} {o_str}")
     print()
-    print(f"total wall-clock: {total_time:.1f}s")
+    print(f"  total wall-clock: {total_elapsed:.1f}s")
 
 
-# --- Main ---------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--continue-on-fail",
-        action="store_true",
-        help="Run remaining stages even if one fails (default: stop)",
+# ---- entry -------------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="MetaExecuTorch model conversion pipeline (TFLite -> ONNX -> PyTorch)"
     )
-    args = parser.parse_args()
+    p.add_argument("--input", required=True, type=Path,
+                   help="Source .tflite model")
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Directory for intermediate + final outputs (default: alongside input)")
+    p.add_argument("--input-shape", nargs=4, type=int, metavar=("N", "C", "H", "W"),
+                   default=None, help="Override input shape, forwarded to stage 1")
+    p.add_argument("--skip-smoke-test", action="store_true",
+                   help="Forwarded to stages that support it")
+    p.add_argument("--verbose", action="store_true")
+    args = p.parse_args()
 
-    total = len(STAGES)
-    results = []
-    failed_stage = None
+    tflite_path = args.input.resolve()
+    if not tflite_path.is_file():
+        print(f"[fail] input not found: {tflite_path}", file=sys.stderr)
+        return 2
 
-    for stage in STAGES:
-        elapsed, status, output = run_stage(stage, total)
-        results.append((elapsed, status, output))
+    out_dir = (args.output_dir or tflite_path.parent).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        if status == "FAIL" and not args.continue_on_fail:
-            failed_stage = stage
-            # Pad results so summary table aligns
-            for _ in STAGES[len(results):]:
-                results.append((0.0, "-", ""))
+    fp32_onnx = out_dir / f"{tflite_path.stem}.fp32.onnx"
+    pt_path   = out_dir / f"{tflite_path.stem}.pt"
+
+    scripts_dir = Path(__file__).resolve().parent
+
+    # Args forwarded to whichever stage accepts them
+    shape_args: list[str] = (
+        ["--input-shape", *map(str, args.input_shape)] if args.input_shape else []
+    )
+    smoke_args: list[str] = ["--skip-smoke-test"] if args.skip_smoke_test else []
+
+    stages = [
+        Stage(
+            description="TFLite -> Clean FP32 ONNX",
+            script=scripts_dir / "tflite_to_clean_fp32_onnx.py",
+            input_path=tflite_path,
+            output_path=fp32_onnx,
+            extra_args=[*shape_args, *smoke_args],
+            runtime_hint="~10-15s",
+        ),
+        Stage(
+            description="ONNX -> PyTorch",
+            script=scripts_dir / "onnx_to_pytorch.py",
+            input_path=fp32_onnx,
+            output_path=pt_path,
+            extra_args=[*smoke_args],
+            runtime_hint="~5-10s",
+        ),
+    ]
+
+    t_start = time.perf_counter()
+    aborted_at: int | None = None
+
+    for idx, stage in enumerate(stages, start=1):
+        ok = run_stage(stage, idx, len(stages), args.verbose)
+        print()
+        if not ok:
+            aborted_at = idx
             break
 
-    print_summary(results, total)
+    total_elapsed = time.perf_counter() - t_start
+    print_summary(stages, total_elapsed)
 
-    if failed_stage:
+    if aborted_at is not None:
         print()
-        print(f"{C.FAIL}[fail]{C.RESET} pipeline aborted at stage "
-              f"{failed_stage['num']} ({failed_stage['title']})")
-        sys.exit(1)
+        fail(f"pipeline aborted at stage {aborted_at} "
+             f"({stages[aborted_at - 1].description})")
+        return 1
 
     print()
-    print(f"{C.OK}[ ok ]{C.RESET} pipeline complete -- "
-          f"final output: {STAGES[-1]['output']}")
-    sys.exit(0)
+    print(f"  {C.OK}[ok]{C.RESET} pipeline complete -> {stages[-1].output_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
