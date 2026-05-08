@@ -2,6 +2,7 @@
 from pathlib import Path
 import sys
 import numpy as np
+import torch
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,7 +48,12 @@ for i in range(min(n, 10)):
 
 print("\n=== qfgaohao mb2-ssd-lite (VOC 21) ===")
 net = create_mobilenetv2_ssd_lite(21, is_test=True)
-net.load(str(ROOT / "weights" / "mb2-ssd-lite.pth"))
+state_dict = torch.load(
+    str(ROOT / "weights" / "mb2-ssd-lite.pth"),
+    map_location="cpu",
+    weights_only=False,
+)
+net.load_state_dict(state_dict)
 pred = create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200)
 boxes, labels, probs = pred.predict(img, 10, 0.3)
 print(f"detections: {len(boxes)}")
