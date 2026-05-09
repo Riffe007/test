@@ -1,1 +1,1 @@
-mkdir -p ~/datasets/coco && cd ~/datasets/coco && wget -nc http://images.cocodataset.org/zips/val2017.zip && wget -nc http://images.cocodataset.org/annotations/annotations_trainval2017.zip && unzip -q -n val2017.zip && unzip -q -n annotations_trainval2017.zip && ls -la val2017 | head -5 && ls -la annotations
+cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && source .venv/bin/activate && python evaluation/mobilenetv2/evaluate.py --data-path ~/datasets/coco/val2017 --coco-annotations ~/datasets/coco/annotations/instances_val2017.json --max-samples 5 --skip-pytorch
