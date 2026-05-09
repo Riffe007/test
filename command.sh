@@ -1,1 +1,1 @@
-cd ~/Documents/projects/MetaExecuTorch; for f in ./executorch-toolkit/evaluation/blazeface_short_range/evaluate.py ./executorch-toolkit/evaluation/srgan/evaluate.py; do echo "===== $f ($(wc -l < "$f" 2>/dev/null) lines) ====="; cat "$f" 2>/dev/null || echo "(missing)"; done
+cd ~/Documents/projects/MetaExecuTorch; head -120 executorch-toolkit/evaluation/blazeface_short_range/evaluate.py; echo "---"; grep -rn "pycocotools\|def evaluate_detector\|def evaluate_tflite_detector\|def calculate_map" --include="*.py" executorch-toolkit/ 2>/dev/null | head -20
