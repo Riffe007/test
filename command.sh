@@ -1,1 +1,1 @@
-python evaluation/mobilenetv2/evaluate.py --data-path ../dataset/samples/coco/val2017 --coco-annotations ../dataset/samples/coco/annotations/instances_val2017.json --tflite-model ../model_sources/MobileNetV2/weights/model.tflite --pytorch-weights ../model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth --pytorch-source ../model_sources/MobileNetV2/src/pytorch/pytorch-ssd --max-samples 10 --results-dir /tmp/mobilenetv2_full 2>&1 | tee /tmp/mobilenetv2_full.log
+mkdir -p ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts && rm -f /tmp/fetch.b64
