@@ -1,1 +1,1 @@
-sed -i 's/\r$//' ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py && md5sum ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py && wc -l ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py && file ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py
+md5sum ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py
