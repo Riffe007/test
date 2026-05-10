@@ -1,1 +1,3 @@
-head -3 ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py && grep -c "vision" ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Fetch a deterministic subset of COCO val2017 from HuggingFace mirrors.
