@@ -1,1 +1,1 @@
-md5sum ~/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py
+python3 -c "import ast; ast.parse(open('/home/timothy_riffe/Documents/projects/MetaExecuTorch/executorch-toolkit/scripts/fetch_coco_val_subset.py').read()); print('parse OK')" && cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && source .venv/bin/activate && python3 scripts/fetch_coco_val_subset.py --help
