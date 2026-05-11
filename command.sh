@@ -1,1 +1,5 @@
-echo "=== SRGAN basemodel config (custom-type template) ===" ; find ~/Documents/projects/MetaExecuTorch/executorch-toolkit/tests/integration/configs/srgan/ -name "*basemodel*.json" -exec cat {} \; ; echo "" ; echo "=== CRAFT config (closest analog: custom with output wrapper) ===" ; find ~/Documents/projects/MetaExecuTorch/executorch-toolkit/tests/integration/configs -name "*craft*.json" -exec cat {} \; ; echo "" ; echo "=== Inception basemodel (find the actual path) ===" ; find ~/Documents/projects/MetaExecuTorch/executorch-toolkit -name "config_inception*" 2>/dev/null | head -5 ; find ~/Documents/projects/MetaExecuTorch/executorch-toolkit -name "config_inception*basemodel*" 2>/dev/null -exec cat {} \; ; echo "" ; echo "=== Custom loader logic (what model_path means) ===" ; grep -n -B 2 -A 25 '"custom"\|model_type == .custom\|model_path\|model_format' ~/Documents/projects/MetaExecuTorch/executorch-toolkit/export/common/model_loader_base.py 2>/dev/null | head -100
+cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit
+source .venv/bin/activate
+python export/vision/pytorch_to_executorch_vision.py \
+    tests/integration/configs/mobile_net_v2_ssd/config_mobile_net_v2_ssd_basemodel.json \
+    --generate-report
