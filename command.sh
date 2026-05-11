@@ -1,3 +1,1 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Fetch a deterministic subset of COCO val2017 from HuggingFace mirrors.
+echo "=== Config JSON files in the toolkit ===" ; find ~/Documents/projects/MetaExecuTorch/executorch-toolkit -name "*.json" 2>/dev/null | grep -v __pycache__ | grep -v .venv | grep -iE "(config|inception|mobilenet|export)" | head -20 ; echo "" ; echo "=== export/vision/ contents ===" ; ls ~/Documents/projects/MetaExecuTorch/executorch-toolkit/export/vision/ ; echo "" ; echo "=== export/common/ contents ===" ; ls ~/Documents/projects/MetaExecuTorch/executorch-toolkit/export/common/ ; echo "" ; echo "=== Are there registered models? ===" ; grep -rn -E "(MODEL_REGISTRY|register_model|MODELS\s*=|inception_v3|mobilenet)" ~/Documents/projects/MetaExecuTorch/executorch-toolkit/export/ 2>/dev/null | grep -v __pycache__ | head -20
