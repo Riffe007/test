@@ -1,11 +1,11 @@
 {
   "model": {
-    "model_path": "../model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth",
+    "model_path": "../model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth",
     "model_type": "custom",
     "model_name": "mobile_net_v2_ssd",
     "input_shape": [1, 3, 300, 300],
     "use_pretrained": false,
-    "source_path": "../model_sources/MobileNetV2"
+    "source_path": "../model_sources/MobileNetV2/src/pytorch/pytorch-ssd"
   },
   "export": {
     "enabled": true,
