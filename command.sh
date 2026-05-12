@@ -1,1 +1,5 @@
 cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && source .venv/bin/activate && mkdir -p ../output/eval_mobilenet_v2_ssd && PYTHONPATH=../model_sources/MobileNetV2/src/pytorch/pytorch-ssd python evaluation/mobilenetv2/evaluate.py --voc-root ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012 --gt-coco-json dataset/voc2012_val_coco.json --tflite-model ../model_sources/MobileNetV2/weights/model.tflite --pytorch-model ../model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth --model-dir tests/integration/outputs/mobile_net_v2_ssd/basemodel_workflow/models --results-dir ../output/eval_mobilenet_v2_ssd --generate-report 2>&1 | tee ../output/eval_run.log
+
+
+
+find ~/Documents/projects/MetaExecuTorch -type f -name "*.json" \( -iname "*voc*" -o -iname "*coco*" \) 2>/dev/null
