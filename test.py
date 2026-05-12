@@ -5,6 +5,11 @@ Reads ``Annotations/*.xml`` for the image stems listed in
 that the existing evaluator (``evaluation/mobilenetv2/evaluate.py``) reads
 without modification.
 
+If ``ImageSets/Main/<split>.txt`` is missing (some Kaggle VOC dumps strip the
+detection split lists when packaging for segmentation-only use), the script
+falls back to deriving the image list from every ``.xml`` file in
+``Annotations/``.
+
 Categories are restricted to the 20 VOC-overlapping COCO classes using the
 same ID assignment the evaluator expects (mirrors its ``COCO_TO_VOC`` table).
 
@@ -89,17 +94,36 @@ def _parse_xml(xml_path: Path) -> tuple[int, int, list[tuple[str, list[int], int
     return width, height, objects
 
 
+def _resolve_stems(voc_root: Path, split: str, annotations_dir: Path) -> list[str]:
+    """Return the list of image stems to convert.
+
+    Preferred source: ``ImageSets/Main/<split>.txt``.
+    Fallback: every ``*.xml`` file in ``Annotations/`` (used when the dump
+    doesn't ship detection split lists).
+    """
+    splits_file = voc_root / "ImageSets" / "Main" / f"{split}.txt"
+    if splits_file.is_file():
+        raw = splits_file.read_text().splitlines()
+        stems = [s for s in (line.strip() for line in raw) if s]
+        _LOG.info("%d image stems from %s", len(stems), splits_file)
+        return stems
+
+    _LOG.warning("splits file not found: %s", splits_file)
+    _LOG.warning("falling back to all .xml stems in %s", annotations_dir)
+    stems = sorted(p.stem for p in annotations_dir.glob("*.xml"))
+    _LOG.info("derived %d stems from annotations/", len(stems))
+    return stems
+
+
 def convert(voc_root: Path, split: str, output: Path, include_difficult: bool) -> None:
     """Convert VOC GT for ``split`` to a COCO-format JSON at ``output``."""
-    splits_file = voc_root / "ImageSets" / "Main" / f"{split}.txt"
     annotations_dir = voc_root / "Annotations"
-    if not splits_file.is_file():
-        raise FileNotFoundError(splits_file)
     if not annotations_dir.is_dir():
         raise FileNotFoundError(annotations_dir)
 
-    stems = [s for s in splits_file.read_text().splitlines() if (s := s.strip())]
-    _LOG.info("split %s: %d image stems", split, len(stems))
+    stems = _resolve_stems(voc_root, split, annotations_dir)
+    if not stems:
+        raise RuntimeError(f"no image stems resolved for split={split!r} under {voc_root}")
 
     images_out: list[dict] = []
     annotations_out: list[dict] = []
@@ -171,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--voc-root", type=Path, required=True,
                    help="Path to VOCdevkit/VOC2012")
     p.add_argument("--split", default="val",
-                   help="Split name in ImageSets/Main/<split>.txt (default: val)")
+                   help="Split name in ImageSets/Main/<split>.txt; if missing, falls back to all XMLs (default: val)")
     p.add_argument("--output", type=Path, required=True,
                    help="Output COCO-format JSON path")
     p.add_argument("--include-difficult", action="store_true",
