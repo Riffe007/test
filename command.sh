@@ -14,3 +14,5 @@ mkdir -p output/baseline_voc_seg && source executorch-toolkit/.venv/bin/activate
 
 
 ls ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012/
+
+python dataset/scripts/voc_to_coco.py --voc-root ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012 --split val --output dataset/voc2012_as_coco/instances_voc2012_val.json
