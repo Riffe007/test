@@ -26,3 +26,8 @@ python executorch-toolkit/evaluation/mobilenetv2/evaluate.py --data-path ~/.cach
 
 
 python executorch-toolkit/evaluation/mobilenetv2/generate_report.py --results output/baseline_voc/evaluation_results.json --output output/baseline_voc/evaluation_report.html
+
+
+
+
+python executorch-toolkit/evaluation/mobilenetv2/generate_report.py --results output/baseline_voc/evaluation_results.json --output output/baseline_voc/evaluation_report.html
