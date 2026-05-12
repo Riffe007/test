@@ -5,3 +5,9 @@ python dataset/scripts/voc_to_coco.py --voc-root ~/.cache/kagglehub/dataset/wata
 
 
 ls -lh dataset/voc2012_as_coco/instances_voc2012_val.json
+
+
+python dataset/scripts/seg_to_coco.py --voc-root ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012 --output dataset/voc2012_as_coco/instances_voc2012_seg.json
+
+
+mkdir -p output/baseline_voc_seg && source executorch-toolkit/.venv/bin/activate && python executorch-toolkit/evaluation/mobilenetv2/evaluate.py --data-path ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012/JPEGImages --coco-annotations dataset/voc2012_as_coco/instances_voc2012_seg.json --tflite-model model_sources/MobileNetV2/weights/model.tflite --pytorch-weights model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth --pytorch-source model_sources/MobileNetV2/src/pytorch/pytorch-ssd --results-dir output/baseline_voc_seg --max-samples 2913 2>&1 | tee output/baseline_voc_seg/run.log
