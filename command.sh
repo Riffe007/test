@@ -1,33 +1,15 @@
-mkdir -p output/baseline_voc && source executorch-toolkit/.venv/bin/activate && python executorch-toolkit/evaluation/mobilenetv2/evaluate.py --data-path ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012/JPEGImages --coco-annotations dataset/voc2012_as_coco/instances_voc2012_val.json --tflite-model model_sources/MobileNetV2/weights/model.tflite --pytorch-weights model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth --pytorch-source model_sources/MobileNetV2/src/pytorch/pytorch-ssd --results-dir output/baseline_voc --max-samples 5000 2>&1 | tee output/baseline_voc/run.log
+python -c "
+import sys, types, torch
+sys.path.insert(0, 'model_sources/MobileNetV2/src/pytorch/pytorch-ssd')
+from vision.ssd.mobilenet_v2_ssd_lite import create_mobilenetv2_ssd_lite
+m = create_mobilenetv2_ssd_lite(num_classes=21, is_test=False)
+m.load_state_dict(torch.load('model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth', map_location='cpu', weights_only=False), strict=True)
+m.eval()
+m.config = types.SimpleNamespace()
+torch.save(m, 'model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth')
+print('saved complete model (is_test=False)')
+"
 
+pip install "executorch[devtools]"
 
-python dataset/scripts/voc_to_coco.py --voc-root ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012 --split val --output dataset/voc2012_as_coco/instances_voc2012_val.json
-
-
-ls -lh dataset/voc2012_as_coco/instances_voc2012_val.json
-
-
-python dataset/scripts/seg_to_coco.py --voc-root ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012 --output dataset/voc2012_as_coco/instances_voc2012_seg.json
-
-
-mkdir -p output/baseline_voc_seg && source executorch-toolkit/.venv/bin/activate && python executorch-toolkit/evaluation/mobilenetv2/evaluate.py --data-path ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012/JPEGImages --coco-annotations dataset/voc2012_as_coco/instances_voc2012_seg.json --tflite-model model_sources/MobileNetV2/weights/model.tflite --pytorch-weights model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth --pytorch-source model_sources/MobileNetV2/src/pytorch/pytorch-ssd --results-dir output/baseline_voc_seg --max-samples 2913 2>&1 | tee output/baseline_voc_seg/run.log
-
-
-ls ~/.cache/kagglehub/dataset/watanabe2362/voctrainval-11may2012/version/1/VOCdevkit/VOC2012/
-
-python dataset/scripts/voc_to_coco.py --voc-root ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012 --split val --output dataset/voc2012_as_coco/instances_voc2012_val.json
-
-
-python executorch-toolkit/evaluation/mobilenetv2/evaluate.py --data-path ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012/JPEGImages --coco-annotations dataset/voc2012_as_coco/instances_voc2012_val.json --tflite-model model_sources/MobileNetV2/weights/model.tflite --pytorch-weights model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth --pytorch-source model_sources/MobileNetV2/src/pytorch/pytorch-ssd --results-dir output/baseline_voc --max-samples 5823 2>&1 | tee output/baseline_voc/run.log
-
-
-python executorch-toolkit/evaluation/mobilenetv2/evaluate.py --data-path ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012/JPEGImages --coco-annotations dataset/voc2012_as_coco/instances_voc2012_val.json --tflite-model model_sources/MobileNetV2/weights/model.tflite --pytorch-weights model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth --pytorch-source model_sources/MobileNetV2/src/pytorch/pytorch-ssd --results-dir output/baseline_voc --max-samples 5823 2>&1 | tee output/baseline_voc/run.log
-
-
-
-python executorch-toolkit/evaluation/mobilenetv2/generate_report.py --results output/baseline_voc/evaluation_results.json --output output/baseline_voc/evaluation_report.html
-
-
-
-
-python executorch-toolkit/evaluation/mobilenetv2/generate_report.py --results output/baseline_voc/evaluation_results.json --output output/baseline_voc/evaluation_report.html
+grep -E "kagglehub|calibration|benchmark" tests/integration/configs/mobile_net_v2_ssd/config_mobile_net_v2_ssd_basemodel.json
