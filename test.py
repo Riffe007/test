@@ -118,21 +118,27 @@ _LOG = logging.getLogger("generate_report")
 def _extract_branches(results: dict) -> list[tuple[str, dict]]:
     """Return ``[(display_name, branch_dict), ...]`` for every model branch.
 
-    A branch is any top-level value that's a dict containing either a
-    ``name`` key or any of the standard metric keys. This deliberately
-    matches whatever layout evaluate.py used without requiring a fixed
-    schema, so future branches (e.g. executorch) appear automatically.
+    A branch is any top-level dict that carries *evidence of an eval result*:
+    metric values, a metrics sub-dict, OR model identification (``model_path``
+    / ``model_size_mb``). The ``name`` field alone is not enough — dataset
+    metadata blocks often carry a name without any metrics, and those should
+    not appear as columns. Future branches (e.g. ExecuTorch) are picked up
+    automatically since they'll carry metrics or model info by definition.
     """
     branches: list[tuple[str, dict]] = []
     for key, value in results.items():
         if not isinstance(value, dict):
             continue
-        looks_like_branch = (
-            "name" in value
+        has_metrics = (
+            isinstance(value.get("metrics"), dict)
+            or any(
+                isinstance(value.get(f"metrics_{scope}"), dict)
+                for scope in ("class_agnostic", "voc_restricted", "class_aware")
+            )
             or any(m in value for m in ALL_METRICS)
-            or any(k in value for k in ("metrics", "metrics_class_agnostic"))
         )
-        if looks_like_branch:
+        has_model_info = "model_path" in value or "model_size_mb" in value
+        if has_metrics or has_model_info:
             display = value.get("name") or key.replace("_baseline", "").replace("_", " ").title()
             branches.append((display, value))
     return branches
