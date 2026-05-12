@@ -8,3 +8,16 @@ cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && source .venv/bin/ac
 
 
 grep -nE "^def |^class " ~/Documents/projects/MetaExecuTorch/executorch-toolkit/evaluation/mobilenetv2/generate_report.py && echo "---LOG---" && grep -iE "html|report|generat|error|traceback" ~/Documents/projects/MetaExecuTorch/output/eval_smoke.log | tail -30
+
+
+python -c "
+import json
+d = json.load(open('/home/timothy_riffe/Documents/projects/MetaExecuTorch/dataset/voc2012_as_coco/instances_voc2012_val.json'))
+print('Categories (id -> name):')
+for c in sorted(d['categories'], key=lambda x: x['id']):
+    print(f'  {c[\"id\"]}: {c[\"name\"]}')
+print('Sample anns:')
+for a in d['annotations'][:3]:
+    print(f'  image_id={a[\"image_id\"]} cat={a[\"category_id\"]} bbox={a[\"bbox\"]}')
+print('Sample image:', {k: d['images'][0][k] for k in ('id','file_name','width','height')})
+"
