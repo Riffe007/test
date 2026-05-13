@@ -211,4 +211,40 @@ PATCH_EOF
 
 
 
+cd ~/Documents/projects/MetaExecuTorch && {
+  echo "========== SOURCE MODELS =========="
+  ls -lh model_sources/MobileNetV2/weights/ 2>/dev/null || echo "  (missing)"
+
+  echo; echo "========== GROUND TRUTH =========="
+  ls -lh dataset/voc2012_as_coco/ 2>/dev/null || echo "  (missing)"
+
+  echo; echo "========== EXECUTORCH .PTE EXPORTS =========="
+  ls -lh executorch-toolkit/tests/integration/outputs/mobile_net_v2_ssd/basemodel_workflow/models/ 2>/dev/null || echo "  (no .pte triplet yet — toolkit export not run)"
+
+  echo; echo "========== TOOLKIT RUN REPORTS / LOGS =========="
+  find executorch-toolkit/tests/integration/outputs/mobile_net_v2_ssd/ -maxdepth 4 -type f \( -name "*.html" -o -name "*.json" -o -name "*.log" -o -name "*.md" \) 2>/dev/null
+
+  echo; echo "========== ETDUMP TRACES =========="
+  find executorch-toolkit -name "*.etdump" -o -name "etdump*.bin" 2>/dev/null | head -10
+  find output -name "*.etdump" 2>/dev/null | head -10
+
+  echo; echo "========== EVAL OUTPUTS (existing) =========="
+  ls -lh output/eval_mobilenet_v2_ssd/ 2>/dev/null || echo "  (no eval outputs yet)"
+
+  echo; echo "========== PHASE 1 (INCEPTION V3) FOR REFERENCE =========="
+  find output -path "*inception_v3*" -type f 2>/dev/null | head -15
+
+  echo; echo "========== VOC IMAGES =========="
+  VOC=~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012/JPEGImages
+  if [ -d "$VOC" ]; then echo "  $VOC: $(ls "$VOC" | wc -l) files"; else echo "  (missing)"; fi
+
+  echo; echo "========== EVALUATOR CODE =========="
+  ls -lh executorch-toolkit/evaluation/mobilenetv2/ 2>/dev/null
+
+  echo; echo "========== TOOLKIT CONFIG =========="
+  ls -lh executorch-toolkit/tests/integration/mobile_net_v2_ssd/ 2>/dev/null
+}
+
+
+
 
