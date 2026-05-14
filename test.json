@@ -1,141 +1,136 @@
 {
-    "_comment": "Config for MobileNetV2-SSD-Lite (qfgaohao) end-to-end pipeline: PyTorch baseline -> ExecuTorch FP32 + INT8 variants -> COCO-style detection evaluation on VOC2012 (adapted to COCO format).",
-
-    "model": {
-        "model_path": "../model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth",
-        "model_type": "custom",
-        "model_name": "mobile_net_v2_ssd",
-        "input_shape": [1, 3, 300, 300],
-        "use_pretrained": true,
-        "normalize": true,
-        "normalize_mean": [0.4980, 0.4980, 0.4980],
-        "normalize_std":  [0.5020, 0.5020, 0.5020],
-        "model_sources_repo_path": "../model_sources/MobileNetV2/src/pytorch/pytorch-ssd",
-        "num_classes": 21,
-        "is_test_mode": false
+  "_comment": "Config for MobileNetV2-SSD-Lite (qfgaohao) end-to-end pipeline: PyTorch baseline -> ExecuTorch FP32 + INT8 variants -> COCO-style detection evaluation on VOC2012.",
+  "model": {
+    "model_path": "../model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth",
+    "model_type": "custom",
+    "model_name": "mobile_net_v2_ssd",
+    "input_shape": [1, 3, 300, 300],
+    "use_pretrained": true,
+    "normalize": true,
+    "normalize_mean": [0.498, 0.498, 0.498],
+    "normalize_std": [0.502, 0.502, 0.502],
+    "num_classes": 21,
+    "source_path": "../model_sources/MobileNetV2/src/pytorch/pytorch-ssd"
+  },
+  "export": {
+    "enabled": true,
+    "is_base": true,
+    "output_dir": "output/models/mobile_net_v2_ssd",
+    "output_name": "mobile_net_v2_ssd_executorch",
+    "dump_ptd": true,
+    "backend": "xnnpack",
+    "strict_export": false,
+    "save_metadata": true,
+    "benchmark": false,
+    "benchmark_iterations": 25,
+    "use_recipes": false,
+    "log_level": "INFO",
+    "enable_profiling": false,
+    "etdump_save_debug_buffer": false,
+    "etdump_debug_buffer_size": 2000000000,
+    "calibration_dir": "../dataset/samples/voc2012",
+    "save_pytorch_model": true
+  },
+  "quantization": [
+    {
+      "enabled": true,
+      "output_name": "mobile_net_v2_ssd_executorch_8a8w_pt",
+      "mode": "static",
+      "weight_dtype": "int8",
+      "activation_dtype": "int8",
+      "per_channel": false,
+      "calibration_samples": 25,
+      "calibration_dir": "../dataset/samples/voc2012"
     },
-
-    "export": {
-        "enabled": true,
-        "is_base": true,
-        "output_dir": "output/models/mobile_net_v2_ssd",
-        "output_name": "mobile_net_v2_ssd_executorch",
-        "dump_ptd": true,
-        "backend": "xnnpack",
-        "strict_export": false,
-        "save_metadata": true,
-        "benchmark": false,
-        "benchmark_iterations": 25,
-        "use_recipes": false,
-        "log_level": "INFO",
-        "enable_profiling": false,
-        "etdump_save_debug_buffer": false,
-        "etdump_debug_buffer_size": 2000000000,
-        "calibration_dir": "../dataset/samples/voc2012",
-        "save_pytorch_model": true
+    {
+      "enabled": true,
+      "output_name": "mobile_net_v2_ssd_executorch_8a8w_pc",
+      "mode": "static",
+      "weight_dtype": "int8",
+      "activation_dtype": "int8",
+      "per_channel": true,
+      "calibration_samples": 25,
+      "calibration_dir": "../dataset/samples/voc2012"
     },
-
-    "quantization": [
-        {
-            "enabled": true,
-            "output_name": "mobile_net_v2_ssd_executorch_8a8w_pt",
-            "mode": "static",
-            "weight_dtype": "int8",
-            "activation_dtype": "int8",
-            "per_channel": false,
-            "calibration_samples": 25,
-            "calibration_dir": "../dataset/samples/voc2012"
-        },
-        {
-            "enabled": true,
-            "output_name": "mobile_net_v2_ssd_executorch_8a8w_pc",
-            "mode": "static",
-            "weight_dtype": "int8",
-            "activation_dtype": "int8",
-            "per_channel": true,
-            "calibration_samples": 25,
-            "calibration_dir": "../dataset/samples/voc2012"
-        },
-        {
-            "enabled": true,
-            "output_name": "mobile_net_v2_ssd_executorch_8da4w",
-            "mode": "dynamic",
-            "weight_dtype": "int4",
-            "activation_dtype": "int8",
-            "per_channel": true,
-            "calibration_samples": 25,
-            "calibration_dir": "../dataset/samples/voc2012"
-        }
-    ],
-
-    "evaluation": {
-        "enabled": true,
-        "task_type": "detection",
-        "primary_metric": "mAP_0.5_0.95",
-
-        "dataset": {
-            "data_path": "~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012",
-            "gt_coco_json": "~/Documents/projects/MetaExecuTorch/dataset/voc2012_as_coco/instances_voc2012_val.json",
-            "split": "val",
-            "batch_size": 1,
-            "num_workers": 4,
-            "max_samples": null,
-            "class_subset": null,
-            "class_names": [
-                "BACKGROUND", "aeroplane", "bicycle", "bird", "boat", "bottle",
-                "bus", "car", "cat", "chair", "cow", "diningtable", "dog",
-                "horse", "motorbike", "person", "pottedplant", "sheep", "sofa",
-                "train", "tvmonitor"
-            ]
-        },
-
-        "decoder": {
-            "image_size": 300,
-            "score_threshold": 0.01,
-            "nms_iou_threshold": 0.45,
-            "max_detections_per_image": 100,
-            "candidate_size": 200,
-            "center_variance": 0.1,
-            "size_variance": 0.2
-        },
-
-        "output": {
-            "results_dir": "~/Documents/projects/MetaExecuTorch/output/results/mobile_net_v2_ssd",
-            "save_per_image_results": true,
-            "save_predictions": true,
-            "save_consolidated_json": true,
-            "consolidated_json_name": "mobile_net_v2_ssd_evaluation.json"
-        },
-
-        "report": {
-            "generate_html": true,
-            "html_name": "MobileNetV2-SSD-Lite_evaluation_report.html",
-            "include_per_image_table": true,
-            "include_metric_interpretations": true,
-            "include_system_info": true
-        },
-
-        "backends": {
-            "include_pytorch_baseline": true,
-            "executorch_models": [
-                {
-                    "name": "executorch_fp32",
-                    "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch.pte",
-                    "is_baseline": true
-                },
-                {
-                    "name": "executorch_int8_8a8w_pt",
-                    "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8a8w_pt.pte"
-                },
-                {
-                    "name": "executorch_int8_8a8w_pc",
-                    "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8a8w_pc.pte"
-                },
-                {
-                    "name": "executorch_int4_8da4w",
-                    "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8da4w.pte"
-                }
-            ]
-        }
+    {
+      "enabled": true,
+      "output_name": "mobile_net_v2_ssd_executorch_8da4w",
+      "mode": "dynamic",
+      "weight_dtype": "int4",
+      "activation_dtype": "int8",
+      "per_channel": true,
+      "calibration_samples": 25,
+      "calibration_dir": "../dataset/samples/voc2012"
     }
+  ],
+  "evaluation": {
+    "enabled": true,
+    "task_type": "detection",
+    "primary_metric": "mAP_0.5_0.95",
+    "dataset": {
+      "data_path": "~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012",
+      "gt_coco_json": "~/Documents/projects/MetaExecuTorch/dataset/voc2012_as_coco/instances_voc2012_val.json",
+      "split": "val",
+      "batch_size": 1,
+      "num_workers": 4,
+      "max_samples": null,
+      "class_subset": null,
+      "class_names": [
+        "BACKGROUND", "aeroplane", "bicycle", "bird", "boat", "bottle",
+        "bus", "car", "cat", "chair", "cow", "diningtable", "dog",
+        "horse", "motorbike", "person", "pottedplant", "sheep", "sofa",
+        "train", "tvmonitor"
+      ]
+    },
+    "decoder": {
+      "image_size": 300,
+      "score_threshold": 0.01,
+      "nms_iou_threshold": 0.45,
+      "max_detections_per_image": 100,
+      "candidate_size": 200,
+      "center_variance": 0.1,
+      "size_variance": 0.2
+    },
+    "task": {
+      "source_path": "../model_sources/MobileNetV2/src/pytorch/pytorch-ssd"
+    },
+    "paths": {
+      "results_dir": "~/Documents/projects/MetaExecuTorch/output/results/mobile_net_v2_ssd"
+    },
+    "output": {
+      "save_per_image": true
+    },
+    "report": {
+      "save_predictions": true,
+      "save_consolidated_json": true,
+      "consolidated_json_name": "mobile_net_v2_ssd_evaluation.json",
+      "generate_html": true,
+      "html_name": "MobileNetV2-SSD-Lite_evaluation_report.html",
+      "include_per_image_table": true,
+      "include_metric_interpretations": true,
+      "include_system_info": true
+    },
+    "backends": {
+      "include_pytorch_baseline": true,
+      "executorch_models": [
+        {
+          "name": "executorch_fp32",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch.pte",
+          "is_baseline": true
+        },
+        {
+          "name": "executorch_int8_8a8w_pt",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8a8w_pt.pte"
+        },
+        {
+          "name": "executorch_int8_8a8w_pc",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8a8w_pc.pte"
+        },
+        {
+          "name": "executorch_int4_8da4w",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8da4w.pte"
+        }
+      ]
+    }
+  }
 }
