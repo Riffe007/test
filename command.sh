@@ -215,3 +215,79 @@ print(f'PyTorch baseline F1:            {baseline.get(\"mean_f1\", 0):.4f}  (tar
 # === STEP 8: Open the HTML report ===
 xdg-open output/results/mobile_net_v2_ssd/MobileNetV2-SSD-Lite_evaluation.html 2>/dev/null || \
   echo "Open in browser: file://$(pwd)/output/results/mobile_net_v2_ssd/MobileNetV2-SSD-Lite_evaluation.html"
+
+
+
+
+
+  # ============================================================
+# BLOCK 1 — Diagnose: find qfgaohao's truth + your pipeline's lie
+# ============================================================
+cd ~/Documents/projects/MetaExecuTorch
+
+echo "=== qfgaohao normalization constants ==="
+grep -rn "image_mean\|image_std\|IMAGE_MEAN\|IMAGE_STD" \
+  model_sources/MobileNetV2/src/pytorch/pytorch-ssd/ 2>/dev/null | head -20
+
+echo ""
+echo "=== qfgaohao transforms (TrainAugmentation / TestTransform / PredictionTransform) ==="
+grep -rn "TrainAugmentation\|TestTransform\|PredictionTransform\|ToTensor\|SubtractMeans" \
+  model_sources/MobileNetV2/src/pytorch/pytorch-ssd/vision/ssd/data_preprocessing.py 2>/dev/null
+grep -rn "class SubtractMeans\|class ToTensor\b" \
+  model_sources/MobileNetV2/src/pytorch/pytorch-ssd/vision/transforms/ 2>/dev/null
+
+echo ""
+echo "=== Your toolkit's preprocessor path (where it reads mean/std) ==="
+grep -rn "normalize_mean\|normalize_std" executorch-toolkit/export/ 2>/dev/null | grep -v __pycache__ | grep -v ".json"
+grep -rn "/ 255\|/255\.\|ToTensor()\|to_tensor\b" executorch-toolkit/export/vision/ 2>/dev/null | grep -v __pycache__ | head -20
+
+
+
+
+
+# ============================================================
+# BLOCK 2 — Run one image end-to-end through eager qfgaohao
+#           and dump tensor stats at each stage
+# ============================================================
+cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && source .venv/bin/activate
+
+python - <<'PY'
+import sys, json, numpy as np, torch
+from pathlib import Path
+from PIL import Image
+
+ROOT = Path.home() / "Documents/projects/MetaExecuTorch"
+sys.path.insert(0, str(ROOT / "model_sources/MobileNetV2/src/pytorch/pytorch-ssd"))
+
+from vision.ssd.mobilenet_v2_ssd_lite import create_mobilenetv2_ssd_lite, create_mobilenetv2_ssd_lite_predictor
+
+WEIGHTS = ROOT / "model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth"
+LABELS  = ROOT / "model_sources/MobileNetV2/weights/voc-model-labels.txt"
+
+class_names = [n.strip() for n in open(LABELS)] if LABELS.exists() else \
+              ["BACKGROUND","aeroplane","bicycle","bird","boat","bottle","bus","car","cat",
+               "chair","cow","diningtable","dog","horse","motorbike","person","pottedplant",
+               "sheep","sofa","train","tvmonitor"]
+print(f"num_classes={len(class_names)}  first={class_names[:3]}")
+
+net = create_mobilenetv2_ssd_lite(len(class_names), is_test=True)
+net.load(str(WEIGHTS))
+net.eval()
+print(f"loaded weights: {WEIGHTS}")
+
+samples = sorted((ROOT / "dataset/samples/voc2012").glob("*.jpg"))[:1]
+if not samples:
+    samples = sorted((ROOT / "dataset/samples/voc2012").glob("*"))[:1]
+print(f"sample: {samples[0]}")
+
+img = np.array(Image.open(samples[0]).convert("RGB"))
+print(f"raw img  dtype={img.dtype}  shape={img.shape}  min={img.min()}  max={img.max()}")
+
+predictor = create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200)
+boxes, labels, probs = predictor.predict(img, top_k=10, prob_threshold=0.01)
+print(f"predictions: {len(boxes)} boxes")
+for b, l, p in zip(boxes[:10], labels[:10], probs[:10]):
+    print(f"  {class_names[l]:15s}  p={p:.3f}  box={b.tolist()}")
+PY
+
+
