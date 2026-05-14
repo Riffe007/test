@@ -1,7 +1,7 @@
 cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && source .venv/bin/activate
 
 python - <<'PY'
-import sys, numpy as np, cv2
+import sys, numpy as np, cv2, torch
 from pathlib import Path
 
 ROOT = Path.home() / "Documents/projects/MetaExecuTorch"
@@ -12,28 +12,40 @@ from vision.ssd.mobilenet_v2_ssd_lite import create_mobilenetv2_ssd_lite, create
 WEIGHTS = ROOT / "model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth"
 LABELS  = ROOT / "model_sources/MobileNetV2/weights/voc-model-labels.txt"
 
-class_names = [n.strip() for n in open(LABELS)] if LABELS.exists() else None
-if class_names is None:
-    class_names = ["BACKGROUND","aeroplane","bicycle","bird","boat","bottle","bus","car","cat",
-                   "chair","cow","diningtable","dog","horse","motorbike","person","pottedplant",
-                   "sheep","sofa","train","tvmonitor"]
+class_names = [n.strip() for n in open(LABELS)] if LABELS.exists() else [
+    "BACKGROUND","aeroplane","bicycle","bird","boat","bottle","bus","car","cat",
+    "chair","cow","diningtable","dog","horse","motorbike","person","pottedplant",
+    "sheep","sofa","train","tvmonitor"]
 print(f"classes ({len(class_names)}): {class_names[:5]}...")
 
+obj = torch.load(str(WEIGHTS), map_location="cpu", weights_only=False)
+print(f"loaded object type: {type(obj).__name__}")
+
 net = create_mobilenetv2_ssd_lite(len(class_names), is_test=True)
-net.load(str(WEIGHTS))
+if isinstance(obj, torch.nn.Module):
+    sd = obj.state_dict()
+    print(f"  -> extracted state_dict: {len(sd)} tensors")
+elif isinstance(obj, dict):
+    sd = obj
+    print(f"  -> using dict directly: {len(sd)} tensors")
+else:
+    raise TypeError(f"unexpected type {type(obj)}")
+
+missing, unexpected = net.load_state_dict(sd, strict=False)
+print(f"  missing keys   : {len(missing)}  (first 3: {missing[:3]})")
+print(f"  unexpected keys: {len(unexpected)}  (first 3: {unexpected[:3]})")
 net.eval()
 
-samples = sorted((ROOT / "dataset/samples/voc2012").glob("*.jpg"))
-if not samples:
-    samples = [p for p in (ROOT / "dataset/samples/voc2012").iterdir()
-               if p.suffix.lower() in (".jpg",".jpeg",".png")]
-print(f"sample: {samples[0]}")
+samples = sorted(p for p in (ROOT / "dataset/samples/voc2012").iterdir()
+                 if p.suffix.lower() in (".jpg",".jpeg",".png"))
+print(f"\nsample: {samples[0]}")
 
-img_bgr = cv2.imread(str(samples[0]))       # cv2 = BGR
+img_bgr = cv2.imread(str(samples[0]))
 img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-print(f"img dtype={img_rgb.dtype} shape={img_rgb.shape} min={img_rgb.min()} max={img_rgb.max()}")
+print(f"img dtype={img_rgb.dtype} shape={img_rgb.shape}")
 
 predictor = create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200)
+
 boxes, labels, probs = predictor.predict(img_rgb, top_k=10, prob_threshold=0.20)
 print(f"\nRGB input: {len(boxes)} detections @ p>=0.20")
 for b, l, p in zip(boxes[:10], labels[:10], probs[:10]):
