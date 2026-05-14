@@ -874,16 +874,22 @@ def evaluate_executorch_model(
 # Config helpers
 # ============================================================
 
-def _resolve_path(path_str: Any, config_dir: Path) -> Path:
-    """Resolve a config path relative to the config file's directory.
+def _resolve_path(path_str: Any, toolkit_root: Path) -> Path:
+    """Resolve a config path relative to the toolkit root.
 
-    Absolute paths and ``~``-paths pass through; relative paths anchor at
-    the config file's parent so the toolkit works regardless of CWD.
+    Anchoring at toolkit root (not the config file's directory) matches
+    the convention the export pipeline uses, so e.g.
+    ``../model_sources/MobileNetV2/...`` in the config resolves to
+    ``<project_root>/model_sources/MobileNetV2/...`` regardless of where
+    the config file itself lives (originally next to evaluate.py, now in
+    ``export/configs/vision/``).
+
+    Absolute paths and ``~``-paths pass through unchanged.
     """
     p = Path(str(path_str)).expanduser()
     if p.is_absolute():
         return p
-    return (config_dir / p).resolve()
+    return (toolkit_root / p).resolve()
 
 
 def _load_config(config_path: Path) -> dict:
@@ -919,9 +925,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description='Evaluate MobileNetV2-SSD-Lite Detection Model'
     )
+    # Default config lives at executorch-toolkit/export/configs/vision/.
+    # __file__ is at executorch-toolkit/evaluation/mobilenetv2/evaluate.py,
+    # so parents[2] = executorch-toolkit/ (the toolkit root).
+    _toolkit_root = Path(__file__).resolve().parents[2]
+    _default_config = (
+        _toolkit_root / 'export' / 'configs' / 'vision'
+        / 'config_mobile_net_v2_ssd.json'
+    )
     parser.add_argument(
-        '--config', type=str,
-        default=str(Path(__file__).parent / 'config_mobile_net_v2_ssd.json'),
+        '--config', type=str, default=str(_default_config),
         help='Path to the configuration JSON file',
     )
     parser.add_argument(
@@ -944,8 +957,12 @@ def main() -> None:
 
     # ----- Load config -----
     config_path = Path(args.config).resolve()
-    config_dir = config_path.parent
+    # Toolkit root is the anchor for relative paths inside the config.
+    # __file__ at executorch-toolkit/evaluation/mobilenetv2/evaluate.py
+    # → parents[2] = executorch-toolkit/.
+    toolkit_root = Path(__file__).resolve().parents[2]
     logger.info(f"Loading config from {config_path}")
+    logger.info(f"Toolkit root (path anchor): {toolkit_root}")
     config = _load_config(config_path)
 
     model_cfg = config['model']
@@ -957,15 +974,15 @@ def main() -> None:
     report_cfg = eval_cfg.get('report', {})
 
     # ----- Resolve paths -----
-    data_path = _resolve_path(dataset_cfg['data_path'], config_dir)
-    gt_coco_json = _resolve_path(dataset_cfg['gt_coco_json'], config_dir)
+    data_path = _resolve_path(dataset_cfg['data_path'], toolkit_root)
+    gt_coco_json = _resolve_path(dataset_cfg['gt_coco_json'], toolkit_root)
     pytorch_model_path = _resolve_path(
-        model_cfg['model_path'], config_dir
+        model_cfg['model_path'], toolkit_root
     )
     qfgaohao_repo_path = _resolve_path(
-        model_cfg['model_sources_repo_path'], config_dir
+        model_cfg['model_sources_repo_path'], toolkit_root
     )
-    results_dir = _resolve_path(output_cfg['results_dir'], config_dir)
+    results_dir = _resolve_path(output_cfg['results_dir'], toolkit_root)
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # ----- Detection params -----
@@ -1102,7 +1119,7 @@ def main() -> None:
                     f"(missing pte_path): {entry}"
                 )
                 continue
-            pte_path = _resolve_path(entry['pte_path'], config_dir)
+            pte_path = _resolve_path(entry['pte_path'], toolkit_root)
             if not pte_path.exists():
                 logger.warning(
                     f"PTE not found for '{entry.get('name', '?')}': "
