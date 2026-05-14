@@ -1,5 +1,5 @@
 cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit
-sed -n '860,960p' export/vision/model_loader.py
+sed -n '810,913p' export/vision/model_loader.py
 
 grep -n "model_format\|model_type\|custom" export/vision/model_loader.py | head -30
 
