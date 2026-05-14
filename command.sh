@@ -1,6 +1,9 @@
 cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit
-sed -n '380,420p' export/vision/model_loader.py
+sed -n '860,960p' export/vision/model_loader.py
 
+grep -n "model_format\|model_type\|custom" export/vision/model_loader.py | head -30
+
+grep -n "^def \|^    def " export/vision/model_loader.py
 
 cp export/vision/model_loader.py export/vision/model_loader.py.bak.$(date +%s)
    # apply patch
