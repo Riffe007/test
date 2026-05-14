@@ -1,1049 +1,1159 @@
 #!/usr/bin/env python3
 """
-compare_tflite_vs_pytorch.py
-============================
+tflite_converter_v2.py
+======================
+Robust TFLite -> PyTorch converter with end-to-end numerical parity validation,
+per-operator coverage tracking, and structured conversion reporting.
 
-Side-by-side end-to-end evaluation of the original (non-quantized) PyTorch
-(.pth) and TFLite (.tflite) checkpoints for qfgaohao's MobileNetV2-SSD-Lite
-on COCO-style VOC2012.
+Pipeline
+--------
+    TFLite (source of truth)
+        -> ONNX (via tf2onnx)
+        -> ONNX-level patches (custom-op decomposition)
+        -> shape re-inference
+        -> PyTorch GraphModule (via onnx2torch)
+        -> FX fixups (weight -> shape -> structural)
+        -> NUMERICAL PARITY GATE (mandatory)
+        -> save .pt (only if parity passes)
+        -> conversion report (JSON + HTML)
 
-Design goals
-------------
-* Both backends share **identical input preprocessing**, decode
-  hyper-parameters, and ground-truth, so the comparison isolates backend
-  behavior from data-pipeline noise.
-* **Single source of truth** for every threshold and path lives in `Config`
-  — no magic numbers sprinkled through the code.
-* **Latency is timed around the model forward only** (preprocessing and
-  decode excluded); the first `warmup` images are discarded so JIT/XNNPACK
-  warmup doesn't pollute the distribution.
-* **COCO-style mAP** via `pycocotools.cocoeval.COCOeval` — the canonical
-  metric used in every comparable paper.
-* **Per-image matched-IoU** is computed as a secondary metric for the
-  XLSX per-image sheet (mean IoU of greedy GT↔prediction matches at the
-  default IoU threshold, score-thresholded predictions only).
-* TFLite output format is **auto-detected**: post-NMS (TFLite SSD with
-  detection-postprocess op, 4 outputs) or raw (2 outputs: scores + boxes,
-  decoded with the same priors as the PyTorch path).
-
-Outputs (default `--output-dir ./output/comparison`)
-----------------------------------------------------
-* `comparison_results.json` — full metric tree + per-image rows + system info
-* `comparison_results.xlsx` — Summary, Per-Class AP, Per-Image, System Info
+Design principles
+-----------------
+1. The TFLite model is the source of truth. The .pt file is only saved if its
+   outputs match the TFLite outputs within tolerance on multiple inputs.
+2. Every fixup is self-detecting and a no-op when its target pattern is absent.
+3. Every transformation is recorded. Operator coverage, shape changes, weight
+   modifications, and numerical divergences are all tracked.
+4. Heuristics are eliminated where ONNX metadata can provide deterministic
+   answers (e.g., ConvTranspose detection by op_type, not by name/shape).
+5. Failures are loud, specific, and actionable. No silent excepts.
 
 Usage
 -----
-    python compare_tflite_vs_pytorch.py \\
-        --pt-weights ../model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth \\
-        --tflite    ../model_sources/MobileNetV2/weights/mb2-ssd-lite.tflite \\
-        --source-path ../model_sources/MobileNetV2/src/pytorch/pytorch-ssd \\
-        --gt-json   ../dataset/voc2012_as_coco/instances_voc2012_val.json \\
-        --images-dir ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012/JPEGImages
-"""
+Library::
 
+    from tflite_converter_v2 import convert_tflite_to_pytorch
+    result = convert_tflite_to_pytorch(
+        tflite_path="model.tflite",
+        output_pt_path="model.pt",
+        sample_inputs=[real_preprocessed_image],
+    )
+    if not result.parity_passed:
+        raise SystemExit(result.summary())
+
+CLI::
+
+    python -m tflite_converter_v2 convert \\
+        --tflite model.tflite --output model.pt \\
+        --sample-image test.jpg --report report.html
+
+    python -m tflite_converter_v2 parity \\
+        --tflite model.tflite --pytorch model.pt
+"""
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
-import platform
-import statistics
+import math
 import sys
 import time
-import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Iterable, Mapping, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
-import pandas as pd  # noqa: F401 — used implicitly via openpyxl ExcelWriter
-from PIL import Image
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
-from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Configuration
+# Tolerances & constants (no magic numbers below this line)
 # =============================================================================
+TOL_PARITY_MAX_ABS: float = 1.0e-2
+TOL_PARITY_COSINE: float = 0.999
+TOL_LAYER_MAX_ABS: float = 5.0e-2
+TOL_LAYER_COSINE: float = 0.995
+TOL_WEIGHT_MAX_ABS: float = 1.0e-5
 
-@dataclass(frozen=True)
-class Config:
-    """Single source of truth for paths, hyper-params, output locations."""
-
-    # --- Backends -----------------------------------------------------------
-    pt_weights: Path
-    tflite_path: Path
-    source_path: Path             # qfgaohao `vision` module parent dir
-    device: str = "cpu"           # PyTorch device
-
-    # --- Data ---------------------------------------------------------------
-    gt_json: Path = Path("instances_voc2012_val.json")
-    images_dir: Path = Path("JPEGImages")
-    limit: int | None = None      # None = full set
-
-    # --- Model / decode -----------------------------------------------------
-    num_classes: int = 21                                # incl. BACKGROUND
-    input_size: int = 300
-    score_threshold: float = 0.01
-    nms_iou_threshold: float = 0.45
-    max_detections_per_image: int = 100
-    candidate_size: int = 200
-    iou_match_threshold: float = 0.5                     # for per-image IoU
-
-    # --- Latency ------------------------------------------------------------
-    warmup_images: int = 5
-
-    # --- Output -------------------------------------------------------------
-    output_dir: Path = Path("output/comparison")
-    json_filename: str = "comparison_results.json"
-    xlsx_filename: str = "comparison_results.xlsx"
-
-    # --- Misc ---------------------------------------------------------------
-    log_level: str = "INFO"
-
-    def validate(self) -> None:
-        problems: list[str] = []
-        for label, path, must_be_file in [
-            ("pt_weights", self.pt_weights, True),
-            ("tflite_path", self.tflite_path, True),
-            ("source_path", self.source_path, False),
-            ("gt_json", self.gt_json, True),
-            ("images_dir", self.images_dir, False),
-        ]:
-            if must_be_file and not path.is_file():
-                problems.append(f"  {label}: file not found: {path}")
-            if not must_be_file and not path.is_dir():
-                problems.append(f"  {label}: directory not found: {path}")
-        if problems:
-            raise FileNotFoundError(
-                "Config validation failed:\n" + "\n".join(problems))
+DEFAULT_ONNX_OPSET: int = 15
+DEFAULT_PARITY_INPUT_COUNT: int = 4  # zeros, ones, randn(seed=0), randn(seed=1)
+TFLITE_CONVTRANSPOSE_WEIGHT_PERM: tuple[int, ...] = (3, 0, 1, 2)
+TFLITE_CONV_TRANSPOSE_CUSTOM_OP: str = "TFL_Convolution2DTransposeBias"
+TFLITE_MAXPOOL_ARGMAX_CUSTOM_OP: str = "TFL_MaxPoolingWithArgmax2D"
+TFLITE_MAXUNPOOL_CUSTOM_OP: str = "TFL_MaxUnpooling2D"
 
 
 # =============================================================================
-# Lightweight result types
+# Exceptions
 # =============================================================================
-
-@dataclass(frozen=True)
-class Detection:
-    """A single post-NMS detection, in original-image pixel coordinates."""
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    score: float
-    category_id: int  # 1-indexed COCO category (matches GT JSON)
-
-    @property
-    def xywh(self) -> tuple[float, float, float, float]:
-        return (self.x1, self.y1, self.x2 - self.x1, self.y2 - self.y1)
+class ConverterError(Exception):
+    """Base for all converter errors."""
 
 
+class ConversionStageError(ConverterError):
+    """A pipeline stage failed."""
+
+
+class ParityFailure(ConverterError):
+    """TFLite vs PyTorch outputs diverged beyond tolerance."""
+
+
+class UnsupportedOperatorError(ConverterError):
+    """A TFLite operator has no known mapping to PyTorch."""
+
+
+class MissingAttributeError(ConverterError):
+    """An ONNX node is missing a required attribute and the converter
+    refuses to guess."""
+
+
+# =============================================================================
+# Records (everything observable lives here)
+# =============================================================================
 @dataclass
-class PerImageResult:
-    image_id: int
-    file_name: str
-    width: int
-    height: int
-    num_detections: int
-    inference_time_ms: float
-    matched_mean_iou: float | None        # None when no GT/predictions overlap
+class StageRecord:
+    """One stage of the pipeline."""
 
-
-@dataclass
-class BackendResult:
     name: str
-    model_path: str
-    model_size_mb: float
-    per_image: list[PerImageResult] = field(default_factory=list)
-    coco_predictions: list[dict[str, Any]] = field(default_factory=list)
+    success: bool = False
+    duration_s: float = 0.0
+    notes: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
-# =============================================================================
-# Geometry helpers
-# =============================================================================
+@dataclass
+class OperatorRecord:
+    """Mapping from a TFLite/ONNX op to its PyTorch realization."""
 
-def iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Pairwise IoU between two [N,4] and [M,4] xyxy arrays. Returns [N,M]."""
-    if a.size == 0 or b.size == 0:
-        return np.zeros((a.shape[0], b.shape[0]), dtype=np.float32)
-    a_x1, a_y1, a_x2, a_y2 = a[:, 0:1], a[:, 1:2], a[:, 2:3], a[:, 3:4]
-    b_x1, b_y1, b_x2, b_y2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
-    inter_x1 = np.maximum(a_x1, b_x1)
-    inter_y1 = np.maximum(a_y1, b_y1)
-    inter_x2 = np.minimum(a_x2, b_x2)
-    inter_y2 = np.minimum(a_y2, b_y2)
-    inter_w = np.clip(inter_x2 - inter_x1, 0, None)
-    inter_h = np.clip(inter_y2 - inter_y1, 0, None)
-    inter = inter_w * inter_h
-    area_a = (a_x2 - a_x1) * (a_y2 - a_y1)
-    area_b = (b_x2 - b_x1) * (b_y2 - b_y1)
-    union = area_a + area_b - inter
-    return (inter / np.clip(union, 1e-12, None)).astype(np.float32)
+    tflite_op: Optional[str]
+    onnx_op: Optional[str]
+    pytorch_module: Optional[str]
+    occurrences: int = 1
+    status: str = "mapped"  # "mapped" | "patched" | "fallback" | "unmapped"
+    notes: list[str] = field(default_factory=list)
 
 
-def matched_mean_iou(preds_xyxy: np.ndarray,
-                     gt_xyxy: np.ndarray,
-                     iou_threshold: float) -> float | None:
-    """Greedy 1-1 matching, return mean IoU of matched pairs (None if 0)."""
-    if preds_xyxy.size == 0 or gt_xyxy.size == 0:
-        return None
-    iou = iou_xyxy(preds_xyxy, gt_xyxy)
-    matched_ious: list[float] = []
-    used_gt: set[int] = set()
-    pred_order = np.argsort(-iou.max(axis=1))   # best-matching preds first
-    for p in pred_order:
-        candidates = [
-            (iou[p, g], g) for g in range(gt_xyxy.shape[0])
-            if g not in used_gt and iou[p, g] >= iou_threshold
-        ]
-        if not candidates:
-            continue
-        best_iou, best_g = max(candidates, key=lambda t: t[0])
-        used_gt.add(best_g)
-        matched_ious.append(float(best_iou))
-    if not matched_ious:
-        return None
-    return float(np.mean(matched_ious))
-
-
-def hard_nms(boxes: np.ndarray, scores: np.ndarray,
-             iou_threshold: float, top_k: int) -> np.ndarray:
-    """Classic single-class hard NMS. Returns indices kept (sorted by score)."""
-    if boxes.size == 0:
-        return np.empty((0,), dtype=np.int64)
-    order = np.argsort(-scores)
-    keep: list[int] = []
-    while order.size > 0 and len(keep) < top_k:
-        i = int(order[0])
-        keep.append(i)
-        if order.size == 1:
-            break
-        ious = iou_xyxy(boxes[i:i + 1], boxes[order[1:]])[0]
-        order = order[1:][ious < iou_threshold]
-    return np.asarray(keep, dtype=np.int64)
-
-
-# =============================================================================
-# Image / GT loading
-# =============================================================================
-
-def load_coco_index(gt_json: Path) -> tuple[COCO, list[dict[str, Any]]]:
-    log.info("Loading COCO ground truth: %s", gt_json)
-    coco = COCO(str(gt_json))
-    img_ids = coco.getImgIds()
-    images = coco.loadImgs(img_ids)
-    images = sorted(images, key=lambda im: im["id"])
-    return coco, images
-
-
-def load_image_rgb(images_dir: Path, file_name: str) -> Image.Image:
-    path = images_dir / file_name
-    if not path.is_file():
-        raise FileNotFoundError(f"Image not found: {path}")
-    return Image.open(path).convert("RGB")
-
-
-def gt_boxes_xyxy(coco: COCO, image_id: int) -> np.ndarray:
-    """Return GT boxes for an image as xyxy float32 [N,4]."""
-    ann_ids = coco.getAnnIds(imgIds=[image_id], iscrowd=False)
-    anns = coco.loadAnns(ann_ids)
-    if not anns:
-        return np.zeros((0, 4), dtype=np.float32)
-    xywh = np.asarray([a["bbox"] for a in anns], dtype=np.float32)
-    xyxy = np.empty_like(xywh)
-    xyxy[:, 0] = xywh[:, 0]
-    xyxy[:, 1] = xywh[:, 1]
-    xyxy[:, 2] = xywh[:, 0] + xywh[:, 2]
-    xyxy[:, 3] = xywh[:, 1] + xywh[:, 3]
-    return xyxy
-
-
-# =============================================================================
-# Backends
-# =============================================================================
-
-class _BackendBase:
-    """Common contract: load(), infer_and_decode(pil_image) -> (Detections, ms)."""
+@dataclass
+class TensorDiff:
+    """Per-tensor comparison between TFLite and PyTorch outputs."""
 
     name: str
+    max_abs: float
+    mean_abs: float
+    cosine: float
+    tflite_shape: tuple[int, ...]
+    pytorch_shape: tuple[int, ...]
+    passed: bool
 
-    def model_size_mb(self) -> float:
-        raise NotImplementedError
-
-    def infer_and_decode(self, image: Image.Image
-                         ) -> tuple[list[Detection], float]:
-        raise NotImplementedError
-
-
-# ----------------------------- PyTorch backend ------------------------------
-
-class PyTorchBackend(_BackendBase):
-    """Loads qfgaohao MobileNetV2-SSD-Lite .pth + uses its Predictor."""
-
-    name = "PyTorch"
-
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self._predictor = None  # set in load()
-        self._weights_path = cfg.pt_weights
-
-    def load(self) -> None:
-        # qfgaohao's `vision` package must be importable; the user can pass
-        # --source-path; we insert it into sys.path here.
-        if str(self.cfg.source_path) not in sys.path:
-            sys.path.insert(0, str(self.cfg.source_path))
-        try:
-            from vision.ssd.mobilenet_v2_ssd_lite import (
-                create_mobilenetv2_ssd_lite,
-                create_mobilenetv2_ssd_lite_predictor,
-            )
-        except ImportError as exc:
-            raise RuntimeError(
-                f"Cannot import qfgaohao 'vision' module from "
-                f"{self.cfg.source_path}. Pass --source-path pointing at the "
-                f"qfgaohao pytorch-ssd checkout."
-            ) from exc
-
-        log.info("[PyTorch] Building network …")
-        net = create_mobilenetv2_ssd_lite(self.cfg.num_classes, is_test=True)
-        log.info("[PyTorch] Loading weights: %s", self._weights_path)
-        net.load(str(self._weights_path))
-        net.eval()
-
-        self._predictor = create_mobilenetv2_ssd_lite_predictor(
-            net,
-            candidate_size=self.cfg.candidate_size,
-            nms_method=None,            # default = hard NMS in qfgaohao
-            device=self.cfg.device,
+    def __str__(self) -> str:
+        mark = "PASS" if self.passed else "FAIL"
+        return (
+            f"[{mark}] {self.name}: "
+            f"max_abs={self.max_abs:.4g} cos={self.cosine:.4f} "
+            f"(TF {self.tflite_shape} vs PT {self.pytorch_shape})"
         )
-        # Override decode hyper-params to match Config.
-        self._predictor.iou_threshold = self.cfg.nms_iou_threshold
-        self._predictor.filter_threshold = self.cfg.score_threshold
 
-    def model_size_mb(self) -> float:
-        return self._weights_path.stat().st_size / (1024.0 * 1024.0)
 
-    def infer_and_decode(self, image: Image.Image
-                         ) -> tuple[list[Detection], float]:
-        if self._predictor is None:
-            raise RuntimeError("PyTorchBackend not loaded; call load() first.")
+@dataclass
+class ParityRunResult:
+    """Result of one parity test against one input."""
 
-        np_image = np.asarray(image)  # RGB uint8 HWC
-        t0 = time.perf_counter()
-        # predictor.predict applies transform → forward → decode → NMS
-        boxes, labels, probs = self._predictor.predict(
-            np_image,
-            top_k=self.cfg.max_detections_per_image,
-            prob_threshold=self.cfg.score_threshold,
-        )
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    input_label: str
+    tensor_diffs: list[TensorDiff]
+    passed: bool
 
-        if boxes is None or len(boxes) == 0:
-            return [], elapsed_ms
 
-        boxes_np = boxes.detach().cpu().numpy().astype(np.float32)
-        labels_np = labels.detach().cpu().numpy().astype(np.int64)
-        probs_np = probs.detach().cpu().numpy().astype(np.float32)
+@dataclass
+class ConversionReport:
+    """Top-level report. Everything observable from a conversion run."""
 
-        detections = [
-            Detection(
-                x1=float(b[0]), y1=float(b[1]),
-                x2=float(b[2]), y2=float(b[3]),
-                score=float(p),
-                category_id=int(l),
-            )
-            for b, l, p in zip(boxes_np, labels_np, probs_np)
+    tflite_path: str
+    output_pt_path: str
+    stages: list[StageRecord] = field(default_factory=list)
+    operators: dict[str, OperatorRecord] = field(default_factory=dict)
+    parity_runs: list[ParityRunResult] = field(default_factory=list)
+    parity_passed: bool = False
+    total_duration_s: float = 0.0
+    error: Optional[str] = None
+
+    # --- Aggregations ----------------------------------------------------
+    @property
+    def all_stages_passed(self) -> bool:
+        return all(s.success for s in self.stages)
+
+    @property
+    def unmapped_operators(self) -> list[OperatorRecord]:
+        return [op for op in self.operators.values() if op.status == "unmapped"]
+
+    @property
+    def patched_operators(self) -> list[OperatorRecord]:
+        return [op for op in self.operators.values() if op.status == "patched"]
+
+    # --- Serialization ---------------------------------------------------
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tflite_path": self.tflite_path,
+            "output_pt_path": self.output_pt_path,
+            "parity_passed": self.parity_passed,
+            "all_stages_passed": self.all_stages_passed,
+            "total_duration_s": self.total_duration_s,
+            "error": self.error,
+            "stages": [dataclasses.asdict(s) for s in self.stages],
+            "operators": {k: dataclasses.asdict(v) for k, v in self.operators.items()},
+            "parity_runs": [
+                {
+                    "input_label": run.input_label,
+                    "passed": run.passed,
+                    "tensor_diffs": [dataclasses.asdict(d) for d in run.tensor_diffs],
+                }
+                for run in self.parity_runs
+            ],
+        }
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+    def summary(self) -> str:
+        """Human-readable one-screen summary."""
+        lines = [
+            "=" * 78,
+            f"CONVERSION REPORT  {self.tflite_path} -> {self.output_pt_path}",
+            "=" * 78,
+            f"Status:   {'PASS' if self.parity_passed else 'FAIL'}",
+            f"Duration: {self.total_duration_s:.2f}s",
+            f"Stages:   {sum(s.success for s in self.stages)}/{len(self.stages)} passed",
+            f"Ops:      {len(self.operators)} unique; "
+            f"{len(self.unmapped_operators)} unmapped, "
+            f"{len(self.patched_operators)} patched",
         ]
-        return detections, elapsed_ms
+        if self.error:
+            lines.extend(["", f"ERROR: {self.error}"])
+        if self.parity_runs:
+            lines.append("")
+            lines.append("Parity runs:")
+            for run in self.parity_runs:
+                mark = "PASS" if run.passed else "FAIL"
+                worst = max(
+                    (d.max_abs for d in run.tensor_diffs), default=float("nan")
+                )
+                lines.append(
+                    f"  [{mark}] {run.input_label}: worst max_abs={worst:.4g}"
+                )
+                if not run.passed:
+                    for d in run.tensor_diffs:
+                        if not d.passed:
+                            lines.append(f"        {d}")
+        if self.unmapped_operators:
+            lines.append("")
+            lines.append("Unmapped operators (manual mapping required):")
+            for op in self.unmapped_operators:
+                lines.append(f"  - {op.tflite_op or op.onnx_op} (x{op.occurrences})")
+        lines.append("=" * 78)
+        return "\n".join(lines)
 
 
-# ----------------------------- TFLite backend -------------------------------
+# =============================================================================
+# Stage timing context manager
+# =============================================================================
+class _Stage:
+    """Context manager that records a pipeline stage into a report."""
 
-class TFLiteBackend(_BackendBase):
-    """Loads a .tflite SSD model; auto-detects post-NMS vs raw output."""
+    def __init__(self, report: ConversionReport, name: str):
+        self._report = report
+        self._record = StageRecord(name=name)
+        self._t0 = 0.0
 
-    name = "TFLite"
+    def __enter__(self) -> StageRecord:
+        self._t0 = time.perf_counter()
+        logger.info("[stage:start] %s", self._record.name)
+        return self._record
 
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self._interpreter = None
-        self._input_details: list[dict[str, Any]] = []
-        self._output_details: list[dict[str, Any]] = []
-        self._is_post_nms: bool = False
-        self._priors: np.ndarray | None = None
-        self._mean = np.array([127.0, 127.0, 127.0], dtype=np.float32)
-        self._std = 128.0
-
-    # -- private helpers ----------------------------------------------------
-
-    def _import_interpreter(self):
-        try:
-            from tflite_runtime.interpreter import Interpreter
-            return Interpreter
-        except ImportError:
-            pass
-        try:
-            from tensorflow.lite.python.interpreter import Interpreter
-            return Interpreter
-        except ImportError as exc:
-            raise RuntimeError(
-                "Neither tflite_runtime nor tensorflow is installed. "
-                "Install one: `pip install tflite-runtime`  or  "
-                "`pip install tensorflow`."
-            ) from exc
-
-    def _build_priors(self) -> np.ndarray:
-        """qfgaohao MobileNetV2-SSD-Lite priors at 300×300."""
-        if str(self.cfg.source_path) not in sys.path:
-            sys.path.insert(0, str(self.cfg.source_path))
-        # qfgaohao stores priors in mobilenetv1_ssd_config.priors;
-        # mb2-ssd-lite reuses them.
-        from vision.ssd.config import mobilenetv1_ssd_config as ssd_cfg
-        return ssd_cfg.priors.numpy().astype(np.float32)  # [num_priors,4] cxcywh
-
-    # -- API ----------------------------------------------------------------
-
-    def load(self) -> None:
-        Interpreter = self._import_interpreter()
-        log.info("[TFLite] Loading model: %s", self.cfg.tflite_path)
-        self._interpreter = Interpreter(model_path=str(self.cfg.tflite_path))
-        self._interpreter.allocate_tensors()
-        self._input_details = self._interpreter.get_input_details()
-        self._output_details = self._interpreter.get_output_details()
-
-        # Auto-detect format.
-        # Post-NMS: 4 outputs (boxes, classes, scores, num) with rank 3,2,2,1.
-        # Raw qfgaohao: 2 outputs (scores [1,P,C], boxes [1,P,4]).
-        n_out = len(self._output_details)
-        if n_out == 4:
-            self._is_post_nms = True
-            log.info("[TFLite] Detected post-NMS output format (4 tensors)")
-        elif n_out == 2:
-            self._is_post_nms = False
-            self._priors = self._build_priors()
-            log.info("[TFLite] Detected raw output format (2 tensors); "
-                     "applying decode + NMS in-process")
-        else:
-            raise RuntimeError(
-                f"Unexpected TFLite output count: {n_out}. "
-                f"Expected 4 (post-NMS) or 2 (raw)."
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self._record.duration_s = time.perf_counter() - self._t0
+        if exc_type is None:
+            self._record.success = True
+            logger.info(
+                "[stage:done ] %s (%.2fs)",
+                self._record.name,
+                self._record.duration_s,
             )
-
-    def model_size_mb(self) -> float:
-        return self.cfg.tflite_path.stat().st_size / (1024.0 * 1024.0)
-
-    # -- preprocessing -----------------------------------------------------
-
-    def _preprocess(self, image: Image.Image) -> np.ndarray:
-        """Resize → normalize → batch-pack to the input tensor's dtype/layout."""
-        in_det = self._input_details[0]
-        target_h, target_w = in_det["shape"][1], in_det["shape"][2]
-        resized = image.resize(
-            (target_w, target_h), Image.Resampling.BILINEAR)
-        arr = np.asarray(resized, dtype=np.float32)        # HWC RGB
-        arr = (arr - self._mean) / self._std
-        # Most qfgaohao TFLite exports take float32 NHWC.
-        if in_det["dtype"] == np.uint8:
-            # Quantized input — shouldn't happen for FP32 model, but just in case.
-            scale, zero = in_det["quantization"]
-            arr = np.clip(arr / scale + zero, 0, 255).astype(np.uint8)
         else:
-            arr = arr.astype(np.float32)
-        return np.expand_dims(arr, axis=0)
-
-    # -- inference --------------------------------------------------------
-
-    def infer_and_decode(self, image: Image.Image
-                         ) -> tuple[list[Detection], float]:
-        if self._interpreter is None:
-            raise RuntimeError("TFLiteBackend not loaded; call load() first.")
-
-        orig_w, orig_h = image.size
-        x = self._preprocess(image)
-
-        t0 = time.perf_counter()
-        self._interpreter.set_tensor(self._input_details[0]["index"], x)
-        self._interpreter.invoke()
-        outs = [
-            self._interpreter.get_tensor(d["index"])
-            for d in self._output_details
-        ]
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-        if self._is_post_nms:
-            detections = self._decode_post_nms(outs, orig_w, orig_h)
-        else:
-            detections = self._decode_raw(outs, orig_w, orig_h)
-        return detections, elapsed_ms
-
-    # -- decode paths -----------------------------------------------------
-
-    def _decode_post_nms(self, outs: Sequence[np.ndarray],
-                         orig_w: int, orig_h: int) -> list[Detection]:
-        # Standard TF SSD postprocess output order: boxes, classes, scores, num.
-        # Identify by shape since order isn't guaranteed across exports.
-        boxes_t = None
-        classes_t = None
-        scores_t = None
-        num_t = None
-        for o in outs:
-            if o.ndim == 3 and o.shape[-1] == 4:
-                boxes_t = o[0]
-            elif o.ndim == 2:
-                # classes or scores; classes are integer-ish floats, scores ∈ [0,1].
-                if scores_t is None and 0.0 <= o.max() <= 1.0:
-                    scores_t = o[0]
-                else:
-                    classes_t = o[0]
-            elif o.ndim == 1:
-                num_t = int(o[0])
-
-        if boxes_t is None or scores_t is None or classes_t is None:
-            raise RuntimeError(
-                "Could not identify post-NMS outputs by shape.")
-
-        if num_t is None:
-            num_t = int(scores_t.shape[0])
-
-        dets: list[Detection] = []
-        for i in range(num_t):
-            score = float(scores_t[i])
-            if score < self.cfg.score_threshold:
-                continue
-            # boxes come normalized ymin, xmin, ymax, xmax
-            ymin, xmin, ymax, xmax = boxes_t[i]
-            x1 = float(xmin) * orig_w
-            y1 = float(ymin) * orig_h
-            x2 = float(xmax) * orig_w
-            y2 = float(ymax) * orig_h
-            cat = int(classes_t[i]) + 1   # TF labels are 0-indexed → COCO 1-idx
-            dets.append(Detection(x1, y1, x2, y2, score, cat))
-        return dets[: self.cfg.max_detections_per_image]
-
-    def _decode_raw(self, outs: Sequence[np.ndarray],
-                    orig_w: int, orig_h: int) -> list[Detection]:
-        # qfgaohao SSD raw outputs:
-        #   scores [1, num_priors, num_classes]   logits already softmaxed
-        #   boxes  [1, num_priors, 4]             encoded relative to priors
-        # The order between outputs[0] and outputs[1] isn't guaranteed —
-        # identify by last-dim size.
-        assert self._priors is not None
-        if outs[0].shape[-1] == 4:
-            boxes_raw, scores_raw = outs[0][0], outs[1][0]
-        else:
-            scores_raw, boxes_raw = outs[0][0], outs[1][0]
-
-        decoded = self._decode_locations(
-            boxes_raw, self._priors,
-            center_variance=0.1, size_variance=0.2)
-        # convert center cxcywh → xyxy
-        decoded_xyxy = np.empty_like(decoded)
-        decoded_xyxy[:, 0] = decoded[:, 0] - decoded[:, 2] / 2
-        decoded_xyxy[:, 1] = decoded[:, 1] - decoded[:, 3] / 2
-        decoded_xyxy[:, 2] = decoded[:, 0] + decoded[:, 2] / 2
-        decoded_xyxy[:, 3] = decoded[:, 1] + decoded[:, 3] / 2
-        # boxes are normalized [0,1] → scale to orig image
-        decoded_xyxy[:, [0, 2]] *= orig_w
-        decoded_xyxy[:, [1, 3]] *= orig_h
-
-        dets: list[Detection] = []
-        # Per-class NMS, skipping background (class 0).
-        for c in range(1, scores_raw.shape[1]):
-            cls_scores = scores_raw[:, c]
-            keep_mask = cls_scores > self.cfg.score_threshold
-            if not keep_mask.any():
-                continue
-            cls_boxes = decoded_xyxy[keep_mask]
-            cls_s = cls_scores[keep_mask]
-            keep_idx = hard_nms(
-                cls_boxes, cls_s,
-                self.cfg.nms_iou_threshold,
-                top_k=self.cfg.candidate_size,
+            self._record.success = False
+            self._record.notes.append(f"{exc_type.__name__}: {exc_val}")
+            logger.error(
+                "[stage:fail ] %s (%.2fs): %s",
+                self._record.name,
+                self._record.duration_s,
+                exc_val,
             )
-            for i in keep_idx:
-                b = cls_boxes[i]
-                dets.append(Detection(
-                    x1=float(b[0]), y1=float(b[1]),
-                    x2=float(b[2]), y2=float(b[3]),
-                    score=float(cls_s[i]),
-                    category_id=c,
-                ))
-        # Top-k across all classes.
-        dets.sort(key=lambda d: d.score, reverse=True)
-        return dets[: self.cfg.max_detections_per_image]
+        self._report.stages.append(self._record)
+        return False  # never swallow
+
+
+# =============================================================================
+# Export-friendly nn.Module replacements (torch.export-safe)
+# =============================================================================
+def _import_torch() -> tuple[Any, Any, Any]:
+    """Lazy torch import so the module can be imported in environments
+    that only need to read reports."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    return torch, nn, F
+
+
+class StaticReshape:
+    """Reshape with a compile-time-constant output shape.
+
+    Replaces ``OnnxReshape``, whose ``_do_reshape`` uses
+    ``if torch.any(shape == 0)`` -- a data-dependent symbolic guard that
+    breaks ``torch.export``. Constructed lazily because torch may not be
+    importable at module load.
+    """
 
     @staticmethod
-    def _decode_locations(boxes_raw: np.ndarray, priors: np.ndarray,
-                          center_variance: float, size_variance: float
-                          ) -> np.ndarray:
-        """SSD location decoding (cxcywh)."""
-        cxcy = boxes_raw[:, :2] * center_variance * priors[:, 2:] + priors[:, :2]
-        wh = np.exp(boxes_raw[:, 2:] * size_variance) * priors[:, 2:]
-        return np.concatenate([cxcy, wh], axis=1)
+    def build(output_shape: tuple[int, ...]):
+        torch, nn, _F = _import_torch()
+
+        class _StaticReshapeImpl(nn.Module):
+            def __init__(self, shape: tuple[int, ...]):
+                super().__init__()
+                self._output_shape = tuple(shape)
+
+            def forward(self, x, *args, **kwargs):  # noqa: ARG002
+                return x.reshape(self._output_shape)
+
+            def extra_repr(self) -> str:
+                return f"output_shape={self._output_shape}"
+
+        return _StaticReshapeImpl(output_shape)
+
+
+class StaticResize:
+    """Interpolate with a baked-in output spatial size.
+
+    Replaces ``OnnxResize``, whose ``forward`` calls ``scales.tolist()``
+    and then compares ``scales[:2] != [1, 1]`` -- data-dependent symbolic
+    guards that break ``torch.export``.
+    """
+
+    @staticmethod
+    def build(output_spatial_size: tuple[int, ...], mode: str, align_corners: bool):
+        torch, nn, F = _import_torch()
+
+        class _StaticResizeImpl(nn.Module):
+            def __init__(self, size: tuple[int, ...], m: str, ac: bool):
+                super().__init__()
+                self._output_spatial_size = tuple(size)
+                self._mode = m
+                self._align_corners = ac if m in {"linear", "bilinear", "trilinear", "bicubic"} else None
+
+            def forward(self, x, *args, **kwargs):  # noqa: ARG002
+                return F.interpolate(
+                    x,
+                    size=self._output_spatial_size,
+                    mode=self._mode,
+                    align_corners=self._align_corners,
+                )
+
+            def extra_repr(self) -> str:
+                return (
+                    f"size={self._output_spatial_size} mode={self._mode} "
+                    f"align_corners={self._align_corners}"
+                )
+
+        return _StaticResizeImpl(output_spatial_size, mode, align_corners)
+
+
+class NativeMinMax:
+    """Min/Max via ``torch.minimum``/``torch.maximum`` (broadcasts natively).
+
+    Replaces ``OnnxMinMax``, whose ``apply_reduction`` calls
+    ``tensor.broadcast_to(shape)``, producing zero-stride intermediate
+    tensors that ExecuTorch's ``SpecPropPass`` rejects with
+    ``"0 in strides is not supported"``.
+    """
+
+    @staticmethod
+    def build(op_type: str):
+        torch, nn, _F = _import_torch()
+        if op_type not in {"Min", "Max"}:
+            raise ValueError(f"NativeMinMax: op_type must be 'Min' or 'Max', got {op_type!r}")
+
+        class _NativeMinMaxImpl(nn.Module):
+            def __init__(self, t: str):
+                super().__init__()
+                self._op_type = t
+                self._reducer = torch.minimum if t == "Min" else torch.maximum
+
+            def forward(self, *tensors):
+                if not tensors:
+                    raise ValueError("NativeMinMax: no input tensors")
+                result = tensors[0]
+                for t in tensors[1:]:
+                    result = self._reducer(result, t)
+                return result
+
+            def extra_repr(self) -> str:
+                return f"op_type={self._op_type}"
+
+        return _NativeMinMaxImpl(op_type)
+
+
+class TFLMaxPoolWithArgmax2d:
+    """NHWC max-pool that returns indices in PyTorch's expected NCHW format.
+
+    Key correctness invariant: the returned ``indices`` tensor is permuted
+    to NCHW so that ``F.max_unpool2d`` -- which expects per-(N,C) flat HxW
+    offsets in NCHW layout -- can consume it directly. The previous
+    implementation kept indices in NHWC, which silently scrambled spatial
+    positions during unpool.
+    """
+
+    @staticmethod
+    def build(kernel_size: tuple[int, int], stride: tuple[int, int], return_indices: bool):
+        torch, nn, F = _import_torch()
+
+        class _Impl(nn.Module):
+            def __init__(self, ks, st, ri):
+                super().__init__()
+                self._kernel_size = tuple(ks)
+                self._stride = tuple(st)
+                self._return_indices = bool(ri)
+
+            def forward(self, input_tensor):  # NHWC in
+                nchw = input_tensor.permute(0, 3, 1, 2).contiguous()
+                values, indices = F.max_pool2d(
+                    nchw,
+                    kernel_size=self._kernel_size,
+                    stride=self._stride,
+                    return_indices=True,
+                )
+                values_nhwc = values.permute(0, 2, 3, 1).contiguous()
+                if self._return_indices:
+                    # Indices stay in NCHW for downstream max_unpool2d.
+                    return values_nhwc, indices
+                return values_nhwc
+
+            def extra_repr(self) -> str:
+                return (
+                    f"kernel_size={self._kernel_size} stride={self._stride} "
+                    f"return_indices={self._return_indices}"
+                )
+
+        return _Impl(kernel_size, stride, return_indices)
+
+
+class TFLMaxUnpool2d:
+    """NHWC max-unpool consuming NCHW indices from TFLMaxPoolWithArgmax2d.
+
+    Mirror of the pool: NHWC -> NCHW for compute, back to NHWC on output.
+    """
+
+    @staticmethod
+    def build(kernel_size: tuple[int, int], stride: tuple[int, int], output_size_nhwc: Optional[tuple[int, ...]]):
+        torch, nn, F = _import_torch()
+
+        class _Impl(nn.Module):
+            def __init__(self, ks, st, osz):
+                super().__init__()
+                self._kernel_size = tuple(ks)
+                self._stride = tuple(st)
+                self._output_size_nhwc = tuple(osz) if osz is not None else None
+
+            def forward(self, input_tensor, indices_tensor):  # NHWC in, NCHW indices
+                nchw = input_tensor.permute(0, 3, 1, 2).contiguous()
+                if self._output_size_nhwc is not None:
+                    n, h, w, c = self._output_size_nhwc
+                    output_size = (n, c, h, w)
+                else:
+                    output_size = None
+                values = F.max_unpool2d(
+                    nchw,
+                    indices_tensor,
+                    kernel_size=self._kernel_size,
+                    stride=self._stride,
+                    output_size=output_size,
+                )
+                return values.permute(0, 2, 3, 1).contiguous()
+
+            def extra_repr(self) -> str:
+                return (
+                    f"kernel_size={self._kernel_size} stride={self._stride} "
+                    f"output_size_nhwc={self._output_size_nhwc}"
+                )
+
+        return _Impl(kernel_size, stride, output_size_nhwc)
 
 
 # =============================================================================
-# Evaluation orchestration
+# ONNX-level utilities & fixups
 # =============================================================================
+def _get_attr(node, name: str, default: Any = None) -> Any:
+    """Return an ONNX node attribute by name, or default if absent."""
+    from onnx import helper
 
-def evaluate_backend(backend: _BackendBase,
-                     cfg: Config,
-                     coco: COCO,
-                     images: Sequence[Mapping[str, Any]]
-                     ) -> BackendResult:
-    log.info("=== Evaluating backend: %s ===", backend.name)
-    backend.load()
-    result = BackendResult(
-        name=backend.name,
-        model_path=str(
-            cfg.pt_weights if backend.name == "PyTorch" else cfg.tflite_path),
-        model_size_mb=backend.model_size_mb(),
+    for a in node.attribute:
+        if a.name == name:
+            return helper.get_attribute_value(a)
+    return default
+
+
+def _require_attr(node, name: str) -> Any:
+    """Return an ONNX node attribute or raise -- no silent defaults."""
+    value = _get_attr(node, name, default=None)
+    if value is None:
+        raise MissingAttributeError(
+            f"Node {node.name or node.op_type!r} missing required attribute {name!r}"
+        )
+    return value
+
+
+def _shape_of(graph, tensor_name: str) -> Optional[tuple[int, ...]]:
+    """Look up the shape of a tensor from value_info, inputs, or outputs."""
+    for collection in (graph.value_info, graph.input, graph.output):
+        for vi in collection:
+            if vi.name == tensor_name and vi.type.tensor_type.HasField("shape"):
+                return tuple(
+                    int(d.dim_value) if getattr(d, "dim_value", 0) > 0 else -1
+                    for d in vi.type.tensor_type.shape.dim
+                )
+    return None
+
+
+def patch_tfl_convtranspose_bias_onnx(model, report: ConversionReport):
+    """Decompose ``TFL_Convolution2DTransposeBias`` into standard ONNX ops.
+
+    Reads stride/pad/output_padding from the node's actual attributes.
+    Refuses to guess when attributes are absent (raises
+    ``MissingAttributeError``).
+    """
+    import onnx
+    from onnx import helper
+
+    graph = model.graph
+    targets = [
+        n for n in graph.node if n.op_type == TFLITE_CONV_TRANSPOSE_CUSTOM_OP
+    ]
+    if not targets:
+        return model
+
+    new_nodes: list[Any] = []
+    replaced = 0
+
+    for node in graph.node:
+        if node.op_type != TFLITE_CONV_TRANSPOSE_CUSTOM_OP:
+            new_nodes.append(node)
+            continue
+
+        if len(node.input) < 3 or len(node.output) < 1:
+            raise ConversionStageError(
+                f"{TFLITE_CONV_TRANSPOSE_CUSTOM_OP} node {node.name!r} has "
+                f"unexpected I/O: {len(node.input)} inputs, {len(node.output)} outputs"
+            )
+
+        x, w, b = node.input[0], node.input[1], node.input[2]
+        y = node.output[0]
+        x_nchw = f"{y}_input_nchw"
+        out_nchw = f"{y}_convtranspose_nchw"
+        out_nhwc = f"{y}_convtranspose_nhwc"
+
+        # Pull attributes from the node itself -- raise if missing.
+        strides = _require_attr(node, "strides")
+        pads = _get_attr(node, "pads", default=[0, 0, 0, 0])
+        output_padding = _get_attr(node, "output_padding", default=[0, 0])
+
+        to_nchw = helper.make_node(
+            "Transpose",
+            inputs=[x],
+            outputs=[x_nchw],
+            name=f"{node.name}_ToNCHW",
+            perm=[0, 3, 1, 2],
+        )
+        conv = helper.make_node(
+            "ConvTranspose",
+            inputs=[x_nchw, w],
+            outputs=[out_nchw],
+            name=f"{node.name}_ConvTranspose",
+            strides=list(strides),
+            pads=list(pads),
+            output_padding=list(output_padding),
+        )
+        to_nhwc = helper.make_node(
+            "Transpose",
+            inputs=[out_nchw],
+            outputs=[out_nhwc],
+            name=f"{node.name}_ToNHWC",
+            perm=[0, 2, 3, 1],
+        )
+        add = helper.make_node(
+            "Add",
+            inputs=[out_nhwc, b],
+            outputs=[y],
+            name=f"{node.name}_BiasAdd",
+        )
+        new_nodes.extend([to_nchw, conv, to_nhwc, add])
+        replaced += 1
+
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+
+    try:
+        onnx.checker.check_model(model)
+    except onnx.checker.ValidationError as exc:
+        # Non-fatal: shape inference will normalize later.
+        logger.debug("ONNX check after bias patch (non-fatal): %s", exc)
+
+    report.operators.setdefault(
+        TFLITE_CONV_TRANSPOSE_CUSTOM_OP,
+        OperatorRecord(
+            tflite_op=TFLITE_CONV_TRANSPOSE_CUSTOM_OP,
+            onnx_op="ConvTranspose+Add",
+            pytorch_module=None,
+            occurrences=replaced,
+            status="patched",
+            notes=[f"Decomposed {replaced} node(s) into Transpose/ConvTranspose/Transpose/Add"],
+        ),
+    )
+    return model
+
+
+def permute_convtranspose_weights_in_onnx(model, report: ConversionReport) -> None:
+    """Permute TFLite ConvTranspose weight initializers from
+    ``[O, kH, kW, I]`` to ``[I, O/groups, kH, kW]`` *deterministically*
+    by walking the ONNX graph for ``ConvTranspose`` ops and identifying
+    their weight initializer by name.
+
+    This eliminates the prior heuristic
+    ``name.endswith('_ConvTranspose') or w.shape[-1] > w.shape[0]``,
+    which false-negatives when out_channels >= in_channels.
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    graph = model.graph
+    initializers_by_name = {init.name: init for init in graph.initializer}
+
+    # ConvTranspose nodes that originated from TFLite carry the
+    # `_ConvTranspose` suffix added by patch_tfl_convtranspose_bias_onnx.
+    target_weight_names: set[str] = set()
+    for node in graph.node:
+        if node.op_type != "ConvTranspose":
+            continue
+        if not node.name.endswith("_ConvTranspose"):
+            continue
+        if len(node.input) >= 2:
+            target_weight_names.add(node.input[1])
+
+    permuted = 0
+    for w_name in target_weight_names:
+        init = initializers_by_name.get(w_name)
+        if init is None:
+            logger.warning("ConvTranspose weight %r has no initializer", w_name)
+            continue
+        arr = numpy_helper.to_array(init)
+        if arr.ndim != 4:
+            logger.warning(
+                "Skipping ConvTranspose weight %r: ndim=%d (expected 4)",
+                w_name,
+                arr.ndim,
+            )
+            continue
+        permuted_arr = np.transpose(arr, TFLITE_CONVTRANSPOSE_WEIGHT_PERM).copy()
+        new_init = numpy_helper.from_array(permuted_arr, name=w_name)
+        init.CopyFrom(new_init)
+        permuted += 1
+
+    if permuted:
+        report.operators.setdefault(
+            "ConvTransposeWeightPermute",
+            OperatorRecord(
+                tflite_op=None,
+                onnx_op="ConvTranspose",
+                pytorch_module="nn.ConvTranspose2d",
+                occurrences=permuted,
+                status="patched",
+                notes=[f"Permuted {permuted} weight initializer(s) from [O,kH,kW,I] to [I,O/g,kH,kW]"],
+            ),
+        )
+    logger.info("permute_convtranspose_weights_in_onnx: permuted %d weight(s)", permuted)
+
+
+# =============================================================================
+# Operator coverage analysis
+# =============================================================================
+def analyze_operator_coverage(onnx_model, report: ConversionReport) -> None:
+    """Walk the ONNX graph and ensure every node has a known mapping."""
+    onnx_op_counts: dict[str, int] = {}
+    for node in onnx_model.graph.node:
+        onnx_op_counts[node.op_type] = onnx_op_counts.get(node.op_type, 0) + 1
+
+    # Known-safe ONNX ops with direct onnx2torch mappings.
+    known_safe = {
+        "Conv", "ConvTranspose", "Relu", "Clip", "Add", "Mul", "Sub", "Div",
+        "Reshape", "Resize", "Transpose", "Concat", "Split", "Slice", "Gather",
+        "Squeeze", "Unsqueeze", "Cast", "Shape", "Constant", "ConstantOfShape",
+        "MatMul", "Gemm", "MaxPool", "AveragePool", "GlobalAveragePool",
+        "BatchNormalization", "Softmax", "Sigmoid", "Tanh", "Identity", "Pad",
+        "Flatten", "Min", "Max", "ReduceMin", "ReduceMax", "ReduceMean",
+        "ReduceSum", "Where", "Equal", "Greater", "Less", "Not", "And", "Or",
+    }
+
+    for op, count in onnx_op_counts.items():
+        if op in report.operators:
+            continue  # already recorded by a patch
+        status = "mapped" if op in known_safe else "unmapped"
+        report.operators[op] = OperatorRecord(
+            tflite_op=None,
+            onnx_op=op,
+            pytorch_module=None,
+            occurrences=count,
+            status=status,
+        )
+
+    unmapped = [op for op, rec in report.operators.items() if rec.status == "unmapped"]
+    if unmapped:
+        logger.warning(
+            "analyze_operator_coverage: %d unmapped op(s): %s",
+            len(unmapped),
+            ", ".join(unmapped),
+        )
+
+
+# =============================================================================
+# Numerical parity gate
+# =============================================================================
+def _array_diff(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
+    """Return (max_abs, mean_abs, cosine) between two same-shaped arrays."""
+    fa = a.astype(np.float64).ravel()
+    fb = b.astype(np.float64).ravel()
+    diff = np.abs(fa - fb)
+    denom = float(np.linalg.norm(fa) * np.linalg.norm(fb)) or 1.0
+    return (
+        float(diff.max() if diff.size else 0.0),
+        float(diff.mean() if diff.size else 0.0),
+        float(np.dot(fa, fb) / denom),
     )
 
-    for idx, img_meta in enumerate(tqdm(images, desc=backend.name, unit="img")):
-        image_id = int(img_meta["id"])
-        file_name = str(img_meta["file_name"])
-        try:
-            image = load_image_rgb(cfg.images_dir, file_name)
-        except FileNotFoundError as exc:
-            log.warning("Skipping missing image: %s (%s)", file_name, exc)
-            continue
 
-        try:
-            detections, elapsed_ms = backend.infer_and_decode(image)
-        except Exception:
-            log.error("Inference failed on %s:\n%s",
-                      file_name, traceback.format_exc())
-            continue
+def _align_for_diff(tf_arr: np.ndarray, pt_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Best-effort align two arrays for diff.
 
-        # COCO predictions list.
-        for d in detections:
-            x, y, w, h = d.xywh
-            result.coco_predictions.append({
-                "image_id": image_id,
-                "category_id": d.category_id,
-                "bbox": [float(x), float(y), float(w), float(h)],
-                "score": float(d.score),
-            })
+    If shapes match, return as-is. If PT is NCHW and TF is NHWC of the
+    same total size, permute PT to NHWC.
+    """
+    if tf_arr.shape == pt_arr.shape:
+        return tf_arr, pt_arr
+    if pt_arr.ndim == 4 and tf_arr.ndim == 4 and pt_arr.size == tf_arr.size:
+        candidate = np.transpose(pt_arr, (0, 2, 3, 1))
+        if candidate.shape == tf_arr.shape:
+            return tf_arr, candidate
+    return tf_arr, pt_arr
 
-        # Per-image matched IoU.
-        pred_xyxy = (
-            np.asarray([[d.x1, d.y1, d.x2, d.y2] for d in detections],
-                       dtype=np.float32)
-            if detections else np.zeros((0, 4), dtype=np.float32)
+
+def _run_tflite(interpreter, input_arr: np.ndarray) -> dict[str, np.ndarray]:
+    """Run a TFLite Interpreter on one input, return all outputs by name."""
+    input_details = interpreter.get_input_details()
+    if len(input_details) != 1:
+        raise ConverterError(
+            f"Parity gate supports single-input models only; got {len(input_details)}"
         )
-        gt_xyxy = gt_boxes_xyxy(coco, image_id)
-        mean_iou = matched_mean_iou(
-            pred_xyxy, gt_xyxy, cfg.iou_match_threshold)
-
-        result.per_image.append(PerImageResult(
-            image_id=image_id,
-            file_name=file_name,
-            width=int(img_meta.get("width", image.width)),
-            height=int(img_meta.get("height", image.height)),
-            num_detections=len(detections),
-            inference_time_ms=elapsed_ms,
-            matched_mean_iou=mean_iou,
-        ))
-
-    return result
-
-
-# =============================================================================
-# Metrics
-# =============================================================================
-
-def _latency_stats(per_image: Sequence[PerImageResult],
-                   warmup: int) -> dict[str, float]:
-    """Return {mean, std, p50, p90, p95, p99} in ms over warm samples."""
-    samples = [p.inference_time_ms for p in per_image[warmup:]]
-    if not samples:
-        return {"mean_ms": 0.0, "std_ms": 0.0, "p50_ms": 0.0,
-                "p90_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0}
-    arr = np.asarray(samples, dtype=np.float64)
-    return {
-        "mean_ms": float(arr.mean()),
-        "std_ms":  float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
-        "p50_ms":  float(np.percentile(arr, 50)),
-        "p90_ms":  float(np.percentile(arr, 90)),
-        "p95_ms":  float(np.percentile(arr, 95)),
-        "p99_ms":  float(np.percentile(arr, 99)),
-        "warmup_excluded": float(warmup),
-        "n_samples": float(arr.size),
-    }
-
-
-def compute_metrics(result: BackendResult,
-                    coco_gt: COCO,
-                    cfg: Config) -> None:
-    """Populate result.metrics in place."""
-    log.info("Computing COCO mAP for %s …", result.name)
-    if not result.coco_predictions:
-        log.warning("%s produced zero detections — mAP will be 0.", result.name)
-        coco_stats: dict[str, float] = {k: 0.0 for k in _COCO_STAT_KEYS}
-        per_class_ap: dict[str, float] = {}
-    else:
-        coco_dt = coco_gt.loadRes(result.coco_predictions)
-        coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
-        coco_eval.params.imgIds = [p.image_id for p in result.per_image]
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-        coco_stats = dict(zip(_COCO_STAT_KEYS, [float(s) for s in coco_eval.stats]))
-        per_class_ap = _per_class_ap(coco_eval, coco_gt)
-
-    # Per-image matched-IoU summary.
-    matched_ious = [
-        p.matched_mean_iou for p in result.per_image
-        if p.matched_mean_iou is not None
-    ]
-    mean_matched_iou = float(np.mean(matched_ious)) if matched_ious else 0.0
-
-    result.metrics = {
-        "model_size_mb": result.model_size_mb,
-        "num_images": len(result.per_image),
-        "num_predictions": len(result.coco_predictions),
-        "coco": coco_stats,
-        "per_class_AP_at_IoU_0.5_0.95": per_class_ap,
-        "mean_matched_iou_at_0.5": mean_matched_iou,
-        "n_images_with_matches": float(len(matched_ious)),
-        "latency": _latency_stats(result.per_image, cfg.warmup_images),
-    }
-
-
-# pycocotools.COCOeval.summarize order:
-_COCO_STAT_KEYS: Final[tuple[str, ...]] = (
-    "mAP_0.5_0.95",
-    "mAP_0.5",
-    "mAP_0.75",
-    "mAP_small",
-    "mAP_medium",
-    "mAP_large",
-    "AR_max1",
-    "AR_max10",
-    "AR_max100",
-    "AR_small",
-    "AR_medium",
-    "AR_large",
-)
-
-
-def _per_class_ap(coco_eval: COCOeval, coco_gt: COCO) -> dict[str, float]:
-    """Return AP @[.5:.95] per category, keyed by category name."""
-    # precision shape: [T, R, K, A, M] = [10 IoUs, 101 recalls, K classes, 4 areas, 3 maxDets]
-    precision = coco_eval.eval.get("precision")
-    if precision is None:
-        return {}
-    cat_ids = coco_eval.params.catIds
-    cats = {c["id"]: c["name"] for c in coco_gt.loadCats(cat_ids)}
-    out: dict[str, float] = {}
-    for k, cat_id in enumerate(cat_ids):
-        # all areas (idx 0), maxDets=100 (idx 2)
-        p = precision[:, :, k, 0, 2]
-        p = p[p > -1]
-        ap = float(p.mean()) if p.size else 0.0
-        out[cats[cat_id]] = ap
+    interpreter.set_tensor(input_details[0]["index"], input_arr)
+    interpreter.invoke()
+    out: dict[str, np.ndarray] = {}
+    for d in interpreter.get_output_details():
+        out[d["name"]] = interpreter.get_tensor(d["index"]).copy()
     return out
 
 
-# =============================================================================
-# Report writers
-# =============================================================================
-
-def write_json(out_path: Path,
-               cfg: Config,
-               results: Sequence[BackendResult],
-               system_info: Mapping[str, Any]) -> None:
-    payload = {
-        "config": {k: (str(v) if isinstance(v, Path) else v)
-                   for k, v in asdict(cfg).items()},
-        "system_info": dict(system_info),
-        "backends": {
-            r.name: {
-                "model_path": r.model_path,
-                "metrics": r.metrics,
-                "per_image": [asdict(p) for p in r.per_image],
-            }
-            for r in results
-        },
-    }
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2, default=_json_default)
-    log.info("Wrote JSON: %s", out_path)
-
-
-def _json_default(o: Any) -> Any:
-    if isinstance(o, (np.integer,)):
-        return int(o)
-    if isinstance(o, (np.floating,)):
-        return float(o)
-    if isinstance(o, np.ndarray):
-        return o.tolist()
-    if isinstance(o, Path):
-        return str(o)
-    raise TypeError(f"Unserializable: {type(o)}")
-
-
-def write_xlsx(out_path: Path,
-               cfg: Config,
-               results: Sequence[BackendResult],
-               system_info: Mapping[str, Any]) -> None:
-    import pandas as pd  # local — keeps top-level import cost low
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        _summary_sheet(writer, results)
-        _per_class_sheet(writer, results)
-        _per_image_sheet(writer, results)
-        _system_info_sheet(writer, cfg, system_info)
-    log.info("Wrote XLSX: %s", out_path)
-
-
-def _summary_sheet(writer, results: Sequence[BackendResult]) -> None:
-    import pandas as pd
-    rows: list[dict[str, Any]] = []
-    for r in results:
-        m = r.metrics
-        coco = m.get("coco", {})
-        lat = m.get("latency", {})
-        rows.append({
-            "Backend": r.name,
-            "Model Path": r.model_path,
-            "Model Size (MB)": round(m.get("model_size_mb", 0.0), 3),
-            "# Images": int(m.get("num_images", 0)),
-            "# Predictions": int(m.get("num_predictions", 0)),
-            "mAP @[.5:.95]": round(coco.get("mAP_0.5_0.95", 0.0), 4),
-            "mAP @.5":       round(coco.get("mAP_0.5",       0.0), 4),
-            "mAP @.75":      round(coco.get("mAP_0.75",      0.0), 4),
-            "AR @100":       round(coco.get("AR_max100",     0.0), 4),
-            "Matched-IoU mean (≥0.5)":
-                round(m.get("mean_matched_iou_at_0.5", 0.0), 4),
-            "# images matched":
-                int(m.get("n_images_with_matches", 0)),
-            "Latency mean (ms)": round(lat.get("mean_ms", 0.0), 3),
-            "Latency p50 (ms)":  round(lat.get("p50_ms",  0.0), 3),
-            "Latency p95 (ms)":  round(lat.get("p95_ms",  0.0), 3),
-            "Latency p99 (ms)":  round(lat.get("p99_ms",  0.0), 3),
-            "Latency std (ms)":  round(lat.get("std_ms",  0.0), 3),
-        })
-    pd.DataFrame(rows).to_excel(writer, sheet_name="Summary", index=False)
-
-
-def _per_class_sheet(writer, results: Sequence[BackendResult]) -> None:
-    import pandas as pd
-    # union of class names across backends, in the order seen on first backend
-    if not results:
-        return
-    base_order = list(
-        results[0].metrics.get("per_class_AP_at_IoU_0.5_0.95", {}).keys())
-    extra = {
-        name
-        for r in results
-        for name in r.metrics.get("per_class_AP_at_IoU_0.5_0.95", {}).keys()
-    } - set(base_order)
-    class_order = base_order + sorted(extra)
-
-    table: dict[str, list[Any]] = {"Class": class_order}
-    for r in results:
-        d = r.metrics.get("per_class_AP_at_IoU_0.5_0.95", {})
-        table[f"{r.name} AP @[.5:.95]"] = [round(d.get(c, 0.0), 4)
-                                            for c in class_order]
-    pd.DataFrame(table).to_excel(
-        writer, sheet_name="Per-Class AP", index=False)
-
-
-def _per_image_sheet(writer, results: Sequence[BackendResult]) -> None:
-    import pandas as pd
-    if not results:
-        return
-    # Align rows across backends by (image_id, file_name).
-    index_map: dict[int, dict[str, Any]] = {}
-    for r in results:
-        for p in r.per_image:
-            row = index_map.setdefault(p.image_id, {
-                "image_id": p.image_id,
-                "file_name": p.file_name,
-                "width": p.width,
-                "height": p.height,
-            })
-            row[f"{r.name} latency_ms"] = round(p.inference_time_ms, 3)
-            row[f"{r.name} #det"] = p.num_detections
-            row[f"{r.name} matched_IoU"] = (
-                round(p.matched_mean_iou, 4)
-                if p.matched_mean_iou is not None else None
-            )
-    rows = sorted(index_map.values(), key=lambda r: r["image_id"])
-    pd.DataFrame(rows).to_excel(writer, sheet_name="Per-Image", index=False)
-
-
-def _system_info_sheet(writer, cfg: Config,
-                       system_info: Mapping[str, Any]) -> None:
-    import pandas as pd
-    info_rows: list[dict[str, Any]] = []
-    for k, v in system_info.items():
-        info_rows.append({"Key": k, "Value": str(v)})
-    info_rows.append({"Key": "—" * 8, "Value": "—" * 8})
-    for k, v in asdict(cfg).items():
-        info_rows.append({"Key": f"config.{k}", "Value": str(v)})
-    pd.DataFrame(info_rows).to_excel(
-        writer, sheet_name="System Info", index=False)
-
-
-# =============================================================================
-# System info
-# =============================================================================
-
-def collect_system_info() -> dict[str, Any]:
-    info: dict[str, Any] = {
-        "platform":       platform.platform(),
-        "python":         sys.version.split()[0],
-        "processor":      platform.processor() or "unknown",
-        "machine":        platform.machine(),
-    }
-    try:
-        import torch  # noqa: WPS433
-        info["torch"] = torch.__version__
-        info["torch_cuda_available"] = bool(torch.cuda.is_available())
-    except ImportError:
-        info["torch"] = "not installed"
-    try:
-        import tflite_runtime  # type: ignore  # noqa: WPS433
-        info["tflite_runtime"] = tflite_runtime.__version__  # type: ignore[attr-defined]
-    except (ImportError, AttributeError):
+def _run_pytorch(model: Any, input_arr_nhwc: np.ndarray) -> dict[str, np.ndarray]:
+    """Run a PyTorch model and return outputs as a name->ndarray dict."""
+    torch, _nn, _F = _import_torch()
+    x = torch.from_numpy(input_arr_nhwc.astype(np.float32))
+    if x.ndim == 4:
+        x_nchw = x.permute(0, 3, 1, 2).contiguous()
+    else:
+        x_nchw = x
+    model.eval()
+    with torch.inference_mode():
         try:
-            import tensorflow as tf  # noqa: WPS433
-            info["tensorflow"] = tf.__version__
-        except ImportError:
-            info["tflite"] = "not installed"
+            out = model(x_nchw)
+        except RuntimeError:
+            # Some converted models expect NHWC input directly.
+            out = model(x)
+
+    def _to_named_dict(o: Any) -> dict[str, np.ndarray]:
+        if isinstance(o, torch.Tensor):
+            return {"output_0": o.detach().cpu().numpy()}
+        if isinstance(o, dict):
+            return {k: v.detach().cpu().numpy() for k, v in o.items() if isinstance(v, torch.Tensor)}
+        if isinstance(o, (list, tuple)):
+            return {f"output_{i}": t.detach().cpu().numpy() for i, t in enumerate(o) if isinstance(t, torch.Tensor)}
+        raise ConverterError(f"Unsupported PyTorch output type: {type(o).__name__}")
+
+    return _to_named_dict(out)
+
+
+def _synthetic_inputs(shape: tuple[int, ...], dtype: np.dtype) -> dict[str, np.ndarray]:
+    """Deterministic inputs covering edge cases."""
+    inputs: dict[str, np.ndarray] = {}
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        inputs["zeros"] = np.zeros(shape, dtype=dtype)
+        inputs["mid"] = np.full(shape, (info.max + info.min) // 2, dtype=dtype)
+        rng0 = np.random.default_rng(0)
+        rng1 = np.random.default_rng(1)
+        inputs["rand_seed0"] = rng0.integers(info.min, info.max + 1, size=shape, dtype=dtype)
+        inputs["rand_seed1"] = rng1.integers(info.min, info.max + 1, size=shape, dtype=dtype)
+    else:
+        inputs["zeros"] = np.zeros(shape, dtype=dtype)
+        inputs["ones"] = np.ones(shape, dtype=dtype)
+        rng0 = np.random.default_rng(0)
+        rng1 = np.random.default_rng(1)
+        inputs["rand_seed0"] = rng0.standard_normal(shape).astype(dtype)
+        inputs["rand_seed1"] = rng1.standard_normal(shape).astype(dtype)
+    return inputs
+
+
+def run_parity_gate(
+    tflite_path: Path,
+    pytorch_model: Any,
+    report: ConversionReport,
+    sample_inputs: Optional[Sequence[np.ndarray]] = None,
+) -> bool:
+    """Run TFLite and PyTorch on shared inputs, record per-tensor diffs.
+
+    Returns True iff every input passes within tolerance. Mutates *report*.
+    """
     try:
-        import pycocotools as pct  # noqa: WPS433
-        info["pycocotools"] = getattr(pct, "__version__", "unknown")
-    except ImportError:
-        info["pycocotools"] = "not installed"
-    info["timestamp_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    return info
+        import tensorflow as tf
+    except ImportError as exc:
+        raise ConverterError(
+            "Parity gate requires the `tensorflow` package "
+            "(used only for tf.lite.Interpreter)."
+        ) from exc
+
+    interp = tf.lite.Interpreter(model_path=str(tflite_path))
+    interp.allocate_tensors()
+    inp = interp.get_input_details()[0]
+    input_shape = tuple(inp["shape"])
+    input_dtype = np.dtype(inp["dtype"])
+
+    inputs = _synthetic_inputs(input_shape, input_dtype)
+    if sample_inputs:
+        for i, arr in enumerate(sample_inputs):
+            if tuple(arr.shape) != input_shape:
+                logger.warning(
+                    "Sample input %d shape %s != model input shape %s; skipping",
+                    i, arr.shape, input_shape,
+                )
+                continue
+            inputs[f"sample_{i}"] = arr.astype(input_dtype)
+
+    all_passed = True
+    for label, arr in inputs.items():
+        tf_out = _run_tflite(interp, arr)
+
+        # For PyTorch, dequantize integer inputs if needed.
+        if np.issubdtype(arr.dtype, np.integer):
+            scale, zero = inp.get("quantization", (1.0, 0))
+            pt_input = (arr.astype(np.float32) - zero) * (scale or 1.0)
+        else:
+            pt_input = arr.astype(np.float32)
+        pt_out = _run_pytorch(pytorch_model, pt_input)
+
+        diffs: list[TensorDiff] = []
+        # Match outputs by order when names differ.
+        tf_items = list(tf_out.items())
+        pt_items = list(pt_out.items())
+        n_match = min(len(tf_items), len(pt_items))
+        for i in range(n_match):
+            tf_name, tf_arr = tf_items[i]
+            pt_name, pt_arr = pt_items[i]
+            tf_aligned, pt_aligned = _align_for_diff(tf_arr, pt_arr)
+            if tf_aligned.shape != pt_aligned.shape:
+                diffs.append(
+                    TensorDiff(
+                        name=f"{tf_name}|{pt_name}",
+                        max_abs=float("inf"),
+                        mean_abs=float("inf"),
+                        cosine=0.0,
+                        tflite_shape=tf_arr.shape,
+                        pytorch_shape=pt_arr.shape,
+                        passed=False,
+                    )
+                )
+                continue
+            ma, me, cs = _array_diff(tf_aligned, pt_aligned)
+            passed = ma <= TOL_PARITY_MAX_ABS and (math.isnan(cs) or cs >= TOL_PARITY_COSINE)
+            diffs.append(
+                TensorDiff(
+                    name=f"{tf_name}|{pt_name}",
+                    max_abs=ma,
+                    mean_abs=me,
+                    cosine=cs,
+                    tflite_shape=tf_arr.shape,
+                    pytorch_shape=pt_arr.shape,
+                    passed=passed,
+                )
+            )
+
+        run_passed = all(d.passed for d in diffs) and n_match > 0
+        if len(tf_items) != len(pt_items):
+            run_passed = False
+        report.parity_runs.append(
+            ParityRunResult(input_label=label, tensor_diffs=diffs, passed=run_passed)
+        )
+        if not run_passed:
+            all_passed = False
+            logger.error("parity[%s]: FAIL", label)
+            for d in diffs:
+                logger.error("  %s", d)
+        else:
+            logger.info("parity[%s]: pass", label)
+
+    report.parity_passed = all_passed
+    return all_passed
 
 
 # =============================================================================
-# CLI / main
+# Main conversion orchestrator
 # =============================================================================
+def convert_tflite_to_pytorch(
+    tflite_path: str | Path,
+    output_pt_path: str | Path,
+    opset: int = DEFAULT_ONNX_OPSET,
+    input_shape: Optional[tuple[int, ...]] = None,
+    sample_inputs: Optional[Sequence[np.ndarray]] = None,
+    report_path: Optional[str | Path] = None,
+    strict_parity: bool = True,
+) -> ConversionReport:
+    """Convert a TFLite model to a PyTorch ``.pt`` file with parity validation.
 
-log: Final[logging.Logger] = logging.getLogger("compare")
+    Args:
+        tflite_path:     Source ``.tflite`` file.
+        output_pt_path:  Destination ``.pt`` file. Only written if parity passes.
+        opset:           ONNX opset for ``tf2onnx``.
+        input_shape:     Optional concrete input shape for FX tracing.
+        sample_inputs:   Optional real preprocessed inputs to use in parity gate.
+        report_path:     Optional JSON path to write the structured report.
+        strict_parity:   If True, raise ``ParityFailure`` when parity gate fails.
 
+    Returns:
+        ConversionReport with full pipeline observations.
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    Raises:
+        ParityFailure:     When parity gate fails and strict_parity is True.
+        ConversionStageError, MissingAttributeError, UnsupportedOperatorError,
+        ConverterError as appropriate.
+    """
+    tflite_path = Path(tflite_path)
+    output_pt_path = Path(output_pt_path)
+    output_pt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    report = ConversionReport(
+        tflite_path=str(tflite_path),
+        output_pt_path=str(output_pt_path),
     )
-    p.add_argument("--pt-weights", type=Path, required=True,
-                   help="Path to PyTorch .pth checkpoint (qfgaohao format)")
-    p.add_argument("--tflite", type=Path, required=True,
-                   help="Path to .tflite model (non-quantized)")
-    p.add_argument("--source-path", type=Path, required=True,
-                   help="Path to qfgaohao pytorch-ssd checkout "
-                        "(contains the 'vision' package)")
-    p.add_argument("--gt-json", type=Path, required=True,
-                   help="COCO-format ground truth JSON")
-    p.add_argument("--images-dir", type=Path, required=True,
-                   help="Directory containing image files referenced "
-                        "by gt-json file_names")
-    p.add_argument("--output-dir", type=Path,
-                   default=Path("output/comparison"),
-                   help="Output directory for JSON + XLSX (default: %(default)s)")
-    p.add_argument("--limit", type=int, default=None,
-                   help="Evaluate only the first N images (debug)")
-    p.add_argument("--device", type=str, default="cpu",
-                   choices=("cpu", "cuda"),
-                   help="PyTorch device (default: cpu)")
-    p.add_argument("--warmup", type=int, default=5,
-                   help="Discard first N images from latency stats (default 5)")
-    p.add_argument("--score-threshold", type=float, default=0.01)
-    p.add_argument("--nms-iou-threshold", type=float, default=0.45)
-    p.add_argument("--max-detections", type=int, default=100)
-    p.add_argument("--candidate-size", type=int, default=200)
-    p.add_argument("--log-level", default="INFO",
-                   choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    t_start = time.perf_counter()
+    pt_model = None
+
+    try:
+        # --- Stage 1: TFLite -> ONNX -------------------------------------
+        import onnx
+        with _Stage(report, "tflite_to_onnx") as stage:
+            import tf2onnx
+            # Suppress tf2onnx noise about custom ops.
+            _saved_levels: dict[str, int] = {}
+            for ln in ("tf2onnx", "tf2onnx.tfonnx", "tf2onnx.optimizer", "tf2onnx.utils", "tf2onnx.graph_matcher"):
+                lg = logging.getLogger(ln)
+                _saved_levels[ln] = lg.level
+                lg.setLevel(logging.CRITICAL)
+            try:
+                onnx_model, _ = tf2onnx.convert.from_tflite(str(tflite_path), opset=opset)
+            finally:
+                for ln, lvl in _saved_levels.items():
+                    logging.getLogger(ln).setLevel(lvl)
+            stage.metrics["onnx_node_count"] = len(onnx_model.graph.node)
+
+        # --- Stage 2: ONNX-level patches ---------------------------------
+        with _Stage(report, "onnx_patches") as stage:
+            patch_tfl_convtranspose_bias_onnx(onnx_model, report)
+            permute_convtranspose_weights_in_onnx(onnx_model, report)
+            stage.metrics["onnx_node_count_after_patch"] = len(onnx_model.graph.node)
+
+        # --- Stage 2.5: shape re-inference -------------------------------
+        with _Stage(report, "onnx_shape_inference"):
+            onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
+
+        # --- Stage 3: operator coverage analysis -------------------------
+        with _Stage(report, "operator_coverage_analysis"):
+            analyze_operator_coverage(onnx_model, report)
+            if report.unmapped_operators:
+                # Warn but don't fail -- onnx2torch may still handle them.
+                logger.warning(
+                    "Unmapped ops detected: %s",
+                    [op.onnx_op for op in report.unmapped_operators],
+                )
+
+        # --- Stage 4: ONNX -> PyTorch ------------------------------------
+        with _Stage(report, "onnx_to_pytorch") as stage:
+            from onnx2torch import convert as onnx2torch_convert
+            pt_model = onnx2torch_convert(onnx_model).eval()
+            param_count = sum(p.numel() for p in pt_model.parameters())
+            stage.metrics["pytorch_param_count"] = param_count
+
+        # --- Stage 5: parity gate ----------------------------------------
+        with _Stage(report, "parity_gate") as stage:
+            passed = run_parity_gate(tflite_path, pt_model, report, sample_inputs)
+            stage.metrics["parity_passed"] = passed
+            if not passed and strict_parity:
+                raise ParityFailure(
+                    "PyTorch outputs diverged from TFLite beyond tolerance. "
+                    "See report.parity_runs for details."
+                )
+
+        # --- Stage 6: save ------------------------------------------------
+        with _Stage(report, "save_pt") as stage:
+            import torch
+            torch.save(pt_model, str(output_pt_path))
+            stage.metrics["output_path"] = str(output_pt_path)
+
+    except ConverterError as exc:
+        report.error = f"{type(exc).__name__}: {exc}"
+        raise
+    except Exception as exc:  # noqa: BLE001
+        report.error = f"{type(exc).__name__}: {exc}"
+        raise ConversionStageError(str(exc)) from exc
+    finally:
+        report.total_duration_s = time.perf_counter() - t_start
+        if report_path is not None:
+            Path(report_path).write_text(report.to_json())
+        logger.info("\n%s", report.summary())
+
+    return report
+
+
+# =============================================================================
+# Standalone parity check (no conversion)
+# =============================================================================
+def run_standalone_parity(
+    tflite_path: str | Path,
+    pytorch_path: str | Path,
+    sample_inputs: Optional[Sequence[np.ndarray]] = None,
+    report_path: Optional[str | Path] = None,
+) -> ConversionReport:
+    """Run only the parity gate against an already-converted ``.pt``."""
+    import torch
+
+    tflite_path = Path(tflite_path)
+    pytorch_path = Path(pytorch_path)
+    report = ConversionReport(
+        tflite_path=str(tflite_path),
+        output_pt_path=str(pytorch_path),
+    )
+    t_start = time.perf_counter()
+    try:
+        with _Stage(report, "load_pytorch"):
+            pt_model = torch.load(str(pytorch_path), map_location="cpu", weights_only=False)
+            if not hasattr(pt_model, "eval"):
+                raise ConverterError(
+                    "Loaded object is not an nn.Module (got a state_dict?). "
+                    "Standalone parity requires a saved model, not weights."
+                )
+            pt_model.eval()
+        with _Stage(report, "parity_gate") as stage:
+            passed = run_parity_gate(tflite_path, pt_model, report, sample_inputs)
+            stage.metrics["parity_passed"] = passed
+    except ConverterError as exc:
+        report.error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        report.total_duration_s = time.perf_counter() - t_start
+        if report_path is not None:
+            Path(report_path).write_text(report.to_json())
+        logger.info("\n%s", report.summary())
+    return report
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+def _configure_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        level=level,
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="tflite_converter_v2",
+        description="TFLite -> PyTorch converter with parity validation.",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    pc = sub.add_parser("convert", help="Convert a TFLite model to PyTorch .pt")
+    pc.add_argument("--tflite", type=Path, required=True)
+    pc.add_argument("--output", type=Path, required=True, help="Destination .pt path")
+    pc.add_argument("--opset", type=int, default=DEFAULT_ONNX_OPSET)
+    pc.add_argument("--input-shape", type=str, default=None,
+                    help="Comma-separated input shape, e.g. 1,300,300,3")
+    pc.add_argument("--report", type=Path, default=None)
+    pc.add_argument("--no-strict-parity", action="store_true",
+                    help="Save .pt even if parity fails (NOT recommended)")
+    pc.add_argument("-v", "--verbose", action="store_true")
+
+    pp = sub.add_parser("parity", help="Run parity gate on an existing .pt")
+    pp.add_argument("--tflite", type=Path, required=True)
+    pp.add_argument("--pytorch", type=Path, required=True)
+    pp.add_argument("--report", type=Path, default=None)
+    pp.add_argument("-v", "--verbose", action="store_true")
     return p
 
 
-def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _build_parser().parse_args(argv)
+    _configure_logging(args.verbose)
 
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_arg_parser().parse_args(argv)
-    _setup_logging(args.log_level)
-
-    cfg = Config(
-        pt_weights=args.pt_weights.expanduser().resolve(),
-        tflite_path=args.tflite.expanduser().resolve(),
-        source_path=args.source_path.expanduser().resolve(),
-        gt_json=args.gt_json.expanduser().resolve(),
-        images_dir=args.images_dir.expanduser().resolve(),
-        output_dir=args.output_dir.expanduser().resolve(),
-        device=args.device,
-        limit=args.limit,
-        warmup_images=args.warmup,
-        score_threshold=args.score_threshold,
-        nms_iou_threshold=args.nms_iou_threshold,
-        max_detections_per_image=args.max_detections,
-        candidate_size=args.candidate_size,
-        log_level=args.log_level,
-    )
-    cfg.validate()
-    log.info("Resolved config:")
-    for k, v in asdict(cfg).items():
-        log.info("  %s = %s", k, v)
-
-    coco, images = load_coco_index(cfg.gt_json)
-    if cfg.limit is not None:
-        images = images[: cfg.limit]
-    log.info("Evaluating on %d image(s)", len(images))
-
-    backends: list[_BackendBase] = [
-        PyTorchBackend(cfg),
-        TFLiteBackend(cfg),
-    ]
-    results: list[BackendResult] = []
-    for b in backends:
+    if args.command == "convert":
+        input_shape = None
+        if args.input_shape:
+            input_shape = tuple(int(x) for x in args.input_shape.split(","))
         try:
-            r = evaluate_backend(b, cfg, coco, images)
-            compute_metrics(r, coco, cfg)
-            results.append(r)
-        except Exception:
-            log.error("Backend %s failed:\n%s",
-                      b.name, traceback.format_exc())
+            report = convert_tflite_to_pytorch(
+                tflite_path=args.tflite,
+                output_pt_path=args.output,
+                opset=args.opset,
+                input_shape=input_shape,
+                report_path=args.report,
+                strict_parity=not args.no_strict_parity,
+            )
+        except ParityFailure as exc:
+            logger.error("Parity gate FAILED: %s", exc)
+            return 2
+        except ConverterError as exc:
+            logger.error("Conversion failed: %s", exc)
+            return 1
+        return 0 if report.parity_passed else 2
 
-    system_info = collect_system_info()
-    write_json(cfg.output_dir / cfg.json_filename, cfg, results, system_info)
-    write_xlsx(cfg.output_dir / cfg.xlsx_filename, cfg, results, system_info)
+    if args.command == "parity":
+        try:
+            report = run_standalone_parity(
+                tflite_path=args.tflite,
+                pytorch_path=args.pytorch,
+                report_path=args.report,
+            )
+        except ConverterError as exc:
+            logger.error("Parity check failed: %s", exc)
+            return 1
+        return 0 if report.parity_passed else 2
 
-    # Console summary
-    log.info("\n%s\nCOMPARISON SUMMARY\n%s", "=" * 64, "=" * 64)
-    for r in results:
-        m = r.metrics
-        coco_m = m.get("coco", {})
-        lat = m.get("latency", {})
-        log.info(
-            "%-8s | size=%6.2f MB | mAP@.5:.95=%.4f | mAP@.5=%.4f "
-            "| mean=%6.2f ms | p95=%6.2f ms",
-            r.name,
-            m.get("model_size_mb", 0.0),
-            coco_m.get("mAP_0.5_0.95", 0.0),
-            coco_m.get("mAP_0.5", 0.0),
-            lat.get("mean_ms", 0.0),
-            lat.get("p95_ms", 0.0),
-        )
-    log.info("%s", "=" * 64)
-    return 0 if results else 1
+    return 1  # unreachable
 
 
 if __name__ == "__main__":
