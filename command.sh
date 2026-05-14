@@ -63,3 +63,10 @@ find ~/Documents/projects/MetaExecuTorch/executorch-toolkit \
 cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && \
 python -c "from export.vision.converter_config import ModelConfig; import dataclasses; print([f.name for f in dataclasses.fields(ModelConfig)])" && \
 python -c "import json; print(json.dumps(json.load(open('export/configs/vision/config_mobile_net_v2_ssd.json'))['model'], indent=2))"
+
+
+
+cp /mnt/user-data/outputs/config_mobile_net_v2_ssd.json export/configs/vision/config_mobile_net_v2_ssd.json && \
+source .venv/bin/activate && \
+python export/vision/pytorch_to_executorch_vision.py \
+  export/configs/vision/config_mobile_net_v2_ssd.json --generate-report
