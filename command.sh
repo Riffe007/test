@@ -1,47 +1,78 @@
-cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && source .venv/bin/activate && python3 << 'DIAG_EOF'
+# ============================================================
+# 0. Anchor at project root, activate venv
+# ============================================================
+cd ~/Documents/projects/MetaExecuTorch && source .venv/bin/activate && pwd
+
+# ============================================================
+# 1. Read paths from config (so we delete what config points to,
+#    not what I guessed)
+# ============================================================
+CFG=executorch-toolkit/evaluation/mobilenetv2/config_mobile_net_v2_ssd.json
+test -f "$CFG" || { echo "MISSING: $CFG — copy evaluate.py + config first"; exit 1; }
+
+EXPORT_DIR=$(python -c "import json,os; c=json.load(open('$CFG')); p=c['export']['output_dir']; print(os.path.abspath(os.path.join(os.path.dirname('$CFG'),p)))")
+RESULTS_DIR=$(python -c "import json,os; c=json.load(open('$CFG')); p=c['evaluation']['output']['results_dir']; print(os.path.abspath(os.path.join(os.path.dirname('$CFG'),p)))")
+echo "Export dir:  $EXPORT_DIR"
+echo "Results dir: $RESULTS_DIR"
+
+# ============================================================
+# 2. Nuke previous artifacts (PTE/PTD, ETRecord, JSON, HTML)
+# ============================================================
+rm -rf "$EXPORT_DIR" "$RESULTS_DIR"
+find . -name "*_etrecord.bin" -delete 2>/dev/null
+find . -name "etdump_*.etdp" -delete 2>/dev/null
+echo "✓ Previous artifacts cleaned"
+
+# ============================================================
+# 3. PyTorch → ExecuTorch export (FP32 + 3 quant variants)
+#    Generates: PTE files in $EXPORT_DIR
+#               mobile_net_v2_ssd_export_analysis.html
+# ============================================================
+# >>> EDIT: replace with the toolkit's export entry point you've been using.
+#          Based on the open-tab `mobile_net_v2_ssd_export_analysis.html`,
+#          this is the command that produced that file.
+# Examples of common patterns:
+#   python -m executorch_toolkit.pipeline --config "$CFG" --generate-report
+#   python executorch-toolkit/run.py --config "$CFG" --generate-report
+#   python executorch-toolkit/export.py --config "$CFG" --generate-report
+python <TOOLKIT_EXPORT_ENTRY> --config "$CFG" --generate-report
+
+# Verify PTEs landed
+ls -lh "$EXPORT_DIR"/*.pte 2>/dev/null || { echo "EXPORT FAILED — no PTEs"; exit 1; }
+
+# ============================================================
+# 4. SMOKE EVAL at 25 samples (do this BEFORE the full run)
+#    Catches decoder bugs, path issues, import issues in ~30 sec
+# ============================================================
+cd executorch-toolkit && \
+  python evaluation/mobilenetv2/evaluate.py --max-samples 25
+cd ..
+
+# Inspect the smoke result
+ls -lh "$RESULTS_DIR"/
+python -c "
 import json
-from pathlib import Path
+r = json.load(open('$RESULTS_DIR/mobile_net_v2_ssd_evaluation.json'))
+print(f\"PyTorch mAP_0.5_0.95: {r['pytorch_baseline'].get('metrics',{}).get('mAP_0.5_0.95','MISSING')}\")
+for m in r.get('executorch_models',[]):
+    print(f\"{m['name']} mAP_0.5_0.95: {m['metrics'].get('mAP_0.5_0.95','MISSING')}\")
+"
+# STOP HERE IF: all mAPs are exactly 0.0 (decoder/priors broken) OR JSON missing keys.
+# Continue if: any non-zero mAP appears, even if small. Smoke is just sanity.
 
-ROOT = Path.home() / "Documents/projects/MetaExecuTorch"
-GT = ROOT / "dataset/voc2012_as_coco/instances_voc2012_val.json"
-RES = ROOT / "output/results/mobilenetv2/evaluation_results.json"
+# ============================================================
+# 5. FULL EVAL (5823 images, all 4 ET variants + PyTorch baseline)
+#    Wipe smoke results first so samples_evaluated counts cleanly
+# ============================================================
+rm -rf "$RESULTS_DIR" && mkdir -p "$RESULTS_DIR"
+cd executorch-toolkit && \
+  python evaluation/mobilenetv2/evaluate.py
+cd ..
 
-gt = json.load(open(GT))
-print("=== GT ===")
-print(f"  images: {len(gt['images'])}  annotations: {len(gt['annotations'])}  categories: {len(gt['categories'])}")
-print(f"  sample image:  {gt['images'][0]}")
-print(f"  sample annot:  {gt['annotations'][0]}")
-print(f"  categories: {[(c['id'], c['name']) for c in gt['categories']]}")
-
-res = json.load(open(RES))
-# Walk to find pytorch detections (structure varies)
-def find_dets(obj, path=""):
-    if isinstance(obj, dict):
-        if "detections_coco" in obj and isinstance(obj["detections_coco"], list):
-            yield path, obj["detections_coco"]
-        for k, v in obj.items():
-            yield from find_dets(v, f"{path}.{k}" if path else k)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            yield from find_dets(v, f"{path}[{i}]")
-
-for path, dets in find_dets(res):
-    if not dets: continue
-    print(f"\n=== DETECTIONS @ {path}  (n={len(dets)}) ===")
-    print(f"  sample: {dets[0]}")
-    pred_imgs = {d['image_id'] for d in dets}
-    pred_cats = {d['category_id'] for d in dets}
-    gt_imgs   = {im['id'] for im in gt['images']}
-    gt_cats   = {c['id'] for c in gt['categories']}
-    gt_imgs_with_annot = {a['image_id'] for a in gt['annotations']}
-    print(f"  pred image_ids: {len(pred_imgs)} unique, range {min(pred_imgs)}..{max(pred_imgs)}")
-    print(f"  GT   image_ids: {len(gt_imgs)} unique, range {min(gt_imgs)}..{max(gt_imgs)}")
-    print(f"  intersection of pred image_ids ∩ GT image_ids: {len(pred_imgs & gt_imgs)}")
-    print(f"  intersection of pred image_ids ∩ GT-with-annotations: {len(pred_imgs & gt_imgs_with_annot)}")
-    print(f"  pred category_ids: {sorted(pred_cats)}")
-    print(f"  GT   category_ids: {sorted(gt_cats)}")
-    print(f"  bbox xywh first 3: {[d['bbox'] for d in dets[:3]]}")
-    print(f"  bbox xywh ranges:  x∈[{min(d['bbox'][0] for d in dets):.1f}, {max(d['bbox'][0] for d in dets):.1f}]  y∈[{min(d['bbox'][1] for d in dets):.1f}, {max(d['bbox'][1] for d in dets):.1f}]  w∈[{min(d['bbox'][2] for d in dets):.1f}, {max(d['bbox'][2] for d in dets):.1f}]  h∈[{min(d['bbox'][3] for d in dets):.1f}, {max(d['bbox'][3] for d in dets):.1f}]")
-    print(f"  score range: [{min(d['score'] for d in dets):.4f}, {max(d['score'] for d in dets):.4f}]")
-    break  # just look at the first detection set
-DIAG_EOF
+# ============================================================
+# 6. Verify deliverables
+# ============================================================
+ls -lh "$RESULTS_DIR"/MobileNetV2-SSD-Lite_evaluation_report.html
+ls -lh "$RESULTS_DIR"/mobile_net_v2_ssd_evaluation.json
+ls -lh "$EXPORT_DIR"/mobile_net_v2_ssd_export_analysis.html 2>/dev/null
+echo "✓ DONE"
