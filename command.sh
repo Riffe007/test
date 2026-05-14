@@ -1,72 +1,54 @@
 
-# ─────────────────────────────────────────────────────────────
-# 2️⃣  Read config paths (so cleanup targets what config says,
-#     not what I'm guessing)
-# ─────────────────────────────────────────────────────────────
-CFG=executorch-toolkit/evaluation/mobilenetv2/config_mobile_net_v2_ssd.json
-test -f "$CFG" || { echo "❌ MISSING $CFG — copy evaluate.py + config first"; }
 
-EXPORT_DIR=$(python -c "import json,os; c=json.load(open('$CFG')); print(os.path.abspath(os.path.join(os.path.dirname('$CFG'), c['export']['output_dir'])))")
-RESULTS_DIR=$(python -c "import json,os; c=json.load(open('$CFG')); print(os.path.abspath(os.path.join(os.path.dirname('$CFG'), c['evaluation']['output']['results_dir'])))")
+# 2️⃣  Verify the new files are in place
+test -f executorch-toolkit/evaluation/mobilenetv2/evaluate.py && \
+  test -f executorch-toolkit/export/configs/vision/config_mobile_net_v2_ssd.json && \
+  echo "✓ files in place" || echo "❌ copy evaluate.py and/or config first"
+
+# 3️⃣  Read paths from config (anchored at toolkit root, matching export script convention)
+CFG=executorch-toolkit/export/configs/vision/config_mobile_net_v2_ssd.json
+TOOLKIT_ROOT=$(realpath executorch-toolkit)
+EXPORT_DIR=$(python -c "import json,os; c=json.load(open('$CFG')); print(os.path.realpath(os.path.join('$TOOLKIT_ROOT', c['export']['output_dir'])))")
+RESULTS_DIR=$(python -c "import json,os; c=json.load(open('$CFG')); print(os.path.realpath(os.path.join('$TOOLKIT_ROOT', c['evaluation']['output']['results_dir'])))")
 echo "Export dir : $EXPORT_DIR"
 echo "Results dir: $RESULTS_DIR"
 
-# ─────────────────────────────────────────────────────────────
-# 3️⃣  Nuke previous artifacts (PTE/PTD, ETRecord, JSON, HTML)
-# ─────────────────────────────────────────────────────────────
+# 4️⃣  Nuke previous artifacts (HTML report will be regenerated in step 8)
 rm -rf "$EXPORT_DIR" "$RESULTS_DIR"
 find . -name "*_etrecord.bin" -delete 2>/dev/null
 find . -name "etdump_*.etdp" -delete 2>/dev/null
 echo "✓ Cleaned"
 
-# ─────────────────────────────────────────────────────────────
-# 4️⃣  Discover the toolkit's export entry point
-#     (likely export.py / pipeline.py / run.py at toolkit root)
-# ─────────────────────────────────────────────────────────────
+# 5️⃣  Discover the toolkit's export entry point
 ls executorch-toolkit/*.py 2>/dev/null
-find executorch-toolkit -maxdepth 2 -name "*.py" \( -name "*export*" -o -name "*pipeline*" -o -name "*run*" -o -name "main.py" \) 2>/dev/null
-# 👉 Pick the one that takes --config and generates mobile_net_v2_ssd_export_analysis.html
-#    (the toolkit command you've used before to produce that HTML tab in VS Code)
+find executorch-toolkit -maxdepth 3 -name "*.py" \( -name "*export*" -o -name "*pipeline*" -o -name "*run*" -o -name "main.py" \) 2>/dev/null
+# 👉 The script that previously produced mobile_net_v2_ssd_export_analysis.html
 
-# ─────────────────────────────────────────────────────────────
-# 5️⃣  EXPORT: PyTorch → ExecuTorch (FP32 + 3 quant variants)
-#     ⚠️ Replace EXPORT_SCRIPT with what step 4 surfaces
-# ─────────────────────────────────────────────────────────────
-EXPORT_SCRIPT=executorch-toolkit/export.py   # ← EDIT IF STEP 4 SHOWED A DIFFERENT NAME
-python "$EXPORT_SCRIPT" --config "$CFG" --generate-report
+# 6️⃣  EXPORT: PyTorch → ExecuTorch (replace <EXPORT_SCRIPT> with step 5's result)
+python <EXPORT_SCRIPT> --config "$CFG" --generate-report
 
-# Verify PTEs landed (4 expected: fp32, 8a8w_pt, 8a8w_pc, 8da4w)
-ls -lh "$EXPORT_DIR"/*.pte || { echo "❌ EXPORT FAILED — no PTEs"; }
-ls -lh "$EXPORT_DIR"/*_export_analysis.html 2>/dev/null
+# Verify PTEs landed (expect 4: fp32, 8a8w_pt, 8a8w_pc, 8da4w)
+ls -lh "$EXPORT_DIR"/*.pte
 
-# ─────────────────────────────────────────────────────────────
-# 6️⃣  SMOKE EVAL (25 samples ≈ 30 sec; STOP if every mAP=0.0)
-# ─────────────────────────────────────────────────────────────
+# 7️⃣  SMOKE EVAL — 25 samples, ~30 sec
 python executorch-toolkit/evaluation/mobilenetv2/evaluate.py --max-samples 25
 
+# Check non-zero mAP signal
 python -c "
 import json
 r = json.load(open('$RESULTS_DIR/mobile_net_v2_ssd_evaluation.json'))
-pt = r.get('pytorch_baseline',{}).get('metrics',{})
-print(f\"PyTorch mAP_0.5_0.95: {pt.get('mAP_0.5_0.95','MISSING')}\")
+print(f\"PyTorch  {r['pytorch_baseline'].get('metrics',{}).get('mAP_0.5_0.95','MISS')}\")
 for m in r.get('executorch_models',[]):
-    print(f\"{m['name']:25s} mAP_0.5_0.95: {m['metrics'].get('mAP_0.5_0.95','MISSING')}\")
+    print(f\"{m['name']:25s} {m['metrics'].get('mAP_0.5_0.95','MISS')}\")
 "
-# 🛑 STOP if all numbers are exactly 0.0 (decoder broken — debug at smoke scale)
-# ✅ CONTINUE if any non-zero (even 0.003 means pipeline is mechanically correct)
+# 🛑 STOP if all mAPs are 0.0 (decoder/priors broken)
+# ✅ CONTINUE if any non-zero appears (refactor works; absolute mAP is separate diagnostic)
 
-# ─────────────────────────────────────────────────────────────
-# 7️⃣  FULL EVAL (all 5823 VOC val images, all 4 ET variants + PT baseline)
-#     Wipe smoke first so samples_evaluated counts cleanly
-# ─────────────────────────────────────────────────────────────
+# 8️⃣  FULL EVAL — 5823 images × 5 models. THIS produces the HTML report deliverable.
 rm -rf "$RESULTS_DIR" && mkdir -p "$RESULTS_DIR"
 python executorch-toolkit/evaluation/mobilenetv2/evaluate.py
 
-# ─────────────────────────────────────────────────────────────
-# 8️⃣  Confirm deliverables (these are what you submit)
-# ─────────────────────────────────────────────────────────────
+# 9️⃣  Confirm the HTML report deliverable exists
 ls -lh "$RESULTS_DIR/MobileNetV2-SSD-Lite_evaluation_report.html"
 ls -lh "$RESULTS_DIR/mobile_net_v2_ssd_evaluation.json"
-ls -lh "$EXPORT_DIR"/*_export_analysis.html 2>/dev/null
-echo ""
-echo "✅ DONE — open the HTML report in a browser"
+echo "✅ DONE"
