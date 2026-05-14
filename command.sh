@@ -57,3 +57,9 @@ echo "✅ DONE"
 
 find ~/Documents/projects/MetaExecuTorch/executorch-toolkit \
   \( -name "generate_*.py" -o -name "report_*.py" -o -name "*orchestrator*.py" \) 2>/dev/null
+
+
+
+cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && \
+python -c "from export.vision.converter_config import ModelConfig; import dataclasses; print([f.name for f in dataclasses.fields(ModelConfig)])" && \
+python -c "import json; print(json.dumps(json.load(open('export/configs/vision/config_mobile_net_v2_ssd.json'))['model'], indent=2))"
