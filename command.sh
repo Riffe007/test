@@ -52,3 +52,8 @@ python executorch-toolkit/evaluation/mobilenetv2/evaluate.py
 ls -lh "$RESULTS_DIR/MobileNetV2-SSD-Lite_evaluation_report.html"
 ls -lh "$RESULTS_DIR/mobile_net_v2_ssd_evaluation.json"
 echo "✅ DONE"
+
+
+
+find ~/Documents/projects/MetaExecuTorch/executorch-toolkit \
+  \( -name "generate_*.py" -o -name "report_*.py" -o -name "*orchestrator*.py" \) 2>/dev/null
