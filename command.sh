@@ -1,3 +1,118 @@
+find ~/Documents/projects/MetaExecuTorch -name "*.tflite" 2>/dev/null
+find ~ -name "*.tflite" 2>/dev/null | head -20
+
+
+find ~/Documents/projects/MetaExecuTorch -name "*.tflite" 2>/dev/null
+
+grep -n "tflite\|\.tflite\|Interpreter" executorch-toolkit/export/vision/compare_tflite_vs_pytorch.py | head -30
+
+
+
+
+cd ~/Documents/projects/MetaExecuTorch
+mkdir -p external/models
+cd external/models
+
+wget http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v2_coco_2018_03_29.tar.gz
+tar -xzf ssd_mobilenet_v2_coco_2018_03_29.tar.gz
+
+cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit
+source .venv/bin/activate
+
+python - <<'PY'
+import tensorflow as tf
+converter = tf.lite.TFLiteConverter.from_saved_model(
+    "../external/models/ssd_mobilenet_v2_coco_2018_03_29/saved_model"
+)
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS,
+]
+m = converter.convert()
+open("../external/models/mobile_net_v2_ssd.tflite", "wb").write(m)
+print(f"Wrote {len(m)/1e6:.2f} MB")
+PY
+
+ls -la ../external/models/mobile_net_v2_ssd.tflite
+
+
+
+cd ~/Documents/projects/MetaExecuTorch
+mkdir -p external/models
+cd external/models
+
+# Option 1: Quantized SSD MobileNet V2 (300x300, COCO, INT8) - the standard one
+wget http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03.tar.gz
+tar -xzf ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03.tar.gz
+ls ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03/
+# Contains: model.tflite, tflite_graph.pb, pipeline.config, checkpoint files
+
+# Rename the .tflite to match your config's expected path
+cp ssd_mobilenet_v2_quantized_300x300_coco_2019_01_03/model.tflite mobile_net_v2_ssd.tflite
+
+# Option 2 (alternative): FP32 SSD MobileNet V2
+# wget http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v2_coco_2018_03_29.tar.gz
+# tar -xzf ssd_mobilenet_v2_coco_2018_03_29.tar.gz
+# Note: this one ships frozen_inference_graph.pb, not .tflite — you'd need to convert
+
+# Verify
+ls -la mobile_net_v2_ssd.tflite
+file mobile_net_v2_ssd.tflite
+
+
+cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit
+python -m export.vision.tflite_converter_v2 convert \
+  --tflite ../external/models/mobile_net_v2_ssd.tflite \
+  --output output/models/mobile_net_v2_ssd/mobile_net_v2_ssd.pt \
+  --input-shape 1,300,300,3 \
+  --report output/models/mobile_net_v2_ssd/conversion_report.json \
+  --verbose
+
+
+  cd ~/Documents/projects/MetaExecuTorch
+mkdir -p external/models
+cd external/models
+
+# Download FP32 SSD MobileNet V2 (COCO, 300x300)
+wget http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v2_coco_2018_03_29.tar.gz
+tar -xzf ssd_mobilenet_v2_coco_2018_03_29.tar.gz
+cd ssd_mobilenet_v2_coco_2018_03_29
+ls
+# frozen_inference_graph.pb, model.ckpt.*, pipeline.config, saved_model/
+
+
+
+cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit
+source .venv/bin/activate
+
+python - <<'PY'
+import tensorflow as tf
+
+saved_model_dir = "../external/models/ssd_mobilenet_v2_coco_2018_03_29/saved_model"
+out_path = "../external/models/mobile_net_v2_ssd.tflite"
+
+converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS,  # allows ops without native TFLite kernels
+]
+tflite_model = converter.convert()
+with open(out_path, "wb") as f:
+    f.write(tflite_model)
+print(f"Wrote {out_path}: {len(tflite_model)/1e6:.2f} MB")
+PY
+
+ls -la ../external/models/mobile_net_v2_ssd.tflite
+
+
+
+
+
+
+
+
+
+
 cd ~/Documents/projects/MetaExecuTorch && \
 source executorch-toolkit/.venv/bin/activate && \
 python scripts/compare_tflite_vs_pytorch.py \
