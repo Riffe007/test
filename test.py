@@ -1,30 +1,44 @@
-"""ExecuTorch evaluation script for MobileNetV2-SSD-Lite (object detection).
+#!/usr/bin/env python3
+"""
+compare_tflite_vs_pytorch.py
+============================
 
-Mirrors evaluation/mobile_net_v1/evaluate.py (Phase 1 classification template)
-but adapted for COCO-style detection evaluation against VOC2012-as-COCO ground
-truth. Detection metric functions are embedded module-level rather than living
-in evaluation/common/vision_metrics.py — see Scope & Deviations in the
-submission README for the rationale and the "future cleanup: lift detection
-helpers into vision_metrics.py once a second detection model exists" note.
+Side-by-side end-to-end evaluation of the original (non-quantized) PyTorch
+(.pth) and TFLite (.tflite) checkpoints for qfgaohao's MobileNetV2-SSD-Lite
+on COCO-style VOC2012.
 
-Inputs are driven by the JSON file alongside this module
-(config_mobile_net_v2_ssd.json). CLI flags are limited to runtime overrides
-(--max-samples, --skip-pytorch, --skip-executorch, --generate-report) so the
-evaluation surface area stays declarative; this is a documented deviation from
-V1's argparse-heavy main(), justified by detection requiring 21 class names,
-7 decoder params, and named per-quant pte_paths that don't fit CLI flags.
+Design goals
+------------
+* Both backends share **identical input preprocessing**, decode
+  hyper-parameters, and ground-truth, so the comparison isolates backend
+  behavior from data-pipeline noise.
+* **Single source of truth** for every threshold and path lives in `Config`
+  — no magic numbers sprinkled through the code.
+* **Latency is timed around the model forward only** (preprocessing and
+  decode excluded); the first `warmup` images are discarded so JIT/XNNPACK
+  warmup doesn't pollute the distribution.
+* **COCO-style mAP** via `pycocotools.cocoeval.COCOeval` — the canonical
+  metric used in every comparable paper.
+* **Per-image matched-IoU** is computed as a secondary metric for the
+  XLSX per-image sheet (mean IoU of greedy GT↔prediction matches at the
+  default IoU threshold, score-thresholded predictions only).
+* TFLite output format is **auto-detected**: post-NMS (TFLite SSD with
+  detection-postprocess op, 4 outputs) or raw (2 outputs: scores + boxes,
+  decoded with the same priors as the PyTorch path).
 
-Per-model pipeline:
-    qfgaohao MobileNetV2-SSD-Lite (is_test=False)
-      -> raw (confidences, locations)
-      -> softmax + prior-based decode (vision.utils.box_utils)
-      -> per-class NMS (hard_nms, candidate_size=200, iou=0.45)
-      -> top-K detections (default 100) in COCO xywh-pixel format
-      -> pycocotools COCOeval against the VOC2012-as-COCO ground truth.
+Outputs (default `--output-dir ./output/comparison`)
+----------------------------------------------------
+* `comparison_results.json` — full metric tree + per-image rows + system info
+* `comparison_results.xlsx` — Summary, Per-Class AP, Per-Image, System Info
 
-The PyTorch baseline and each ExecuTorch .pte share the same Python-side
-decoder, which keeps PyTorch-vs-ExecuTorch logits parity meaningful and
-ensures all quantized variants are scored on the same post-processing stack.
+Usage
+-----
+    python compare_tflite_vs_pytorch.py \\
+        --pt-weights ../model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth \\
+        --tflite    ../model_sources/MobileNetV2/weights/mb2-ssd-lite.tflite \\
+        --source-path ../model_sources/MobileNetV2/src/pytorch/pytorch-ssd \\
+        --gt-json   ../dataset/voc2012_as_coco/instances_voc2012_val.json \\
+        --images-dir ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012/JPEGImages
 """
 
 from __future__ import annotations
@@ -32,1229 +46,1005 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import platform
+import statistics
 import sys
-from datetime import datetime
+import time
+import traceback
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Final, Iterable, Mapping, Sequence
 
 import numpy as np
-import torch
-import torch.nn.functional as F
+import pandas as pd  # noqa: F401 — used implicitly via openpyxl ExcelWriter
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-
-# Add project root to path — mirrors mobile_net_v1/evaluate.py line 71.
-sys.path.append(str(Path(__file__).resolve().parents[2]))
-
-from evaluation.common.utils.inference import InferenceTimer
-from evaluation.common.utils.json_io import save_evaluation_results
-from evaluation.common.utils.system_info import get_system_info
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from tqdm import tqdm
 
 
-# ============================================================
-# Logging Setup
-# ============================================================
+# =============================================================================
+# Configuration
+# =============================================================================
 
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure logging (matches V1's setup_logging shape)."""
-    logging.basicConfig(
-        level=level,
-        format='[%(asctime)s] %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
+@dataclass(frozen=True)
+class Config:
+    """Single source of truth for paths, hyper-params, output locations."""
+
+    # --- Backends -----------------------------------------------------------
+    pt_weights: Path
+    tflite_path: Path
+    source_path: Path             # qfgaohao `vision` module parent dir
+    device: str = "cpu"           # PyTorch device
+
+    # --- Data ---------------------------------------------------------------
+    gt_json: Path = Path("instances_voc2012_val.json")
+    images_dir: Path = Path("JPEGImages")
+    limit: int | None = None      # None = full set
+
+    # --- Model / decode -----------------------------------------------------
+    num_classes: int = 21                                # incl. BACKGROUND
+    input_size: int = 300
+    score_threshold: float = 0.01
+    nms_iou_threshold: float = 0.45
+    max_detections_per_image: int = 100
+    candidate_size: int = 200
+    iou_match_threshold: float = 0.5                     # for per-image IoU
+
+    # --- Latency ------------------------------------------------------------
+    warmup_images: int = 5
+
+    # --- Output -------------------------------------------------------------
+    output_dir: Path = Path("output/comparison")
+    json_filename: str = "comparison_results.json"
+    xlsx_filename: str = "comparison_results.xlsx"
+
+    # --- Misc ---------------------------------------------------------------
+    log_level: str = "INFO"
+
+    def validate(self) -> None:
+        problems: list[str] = []
+        for label, path, must_be_file in [
+            ("pt_weights", self.pt_weights, True),
+            ("tflite_path", self.tflite_path, True),
+            ("source_path", self.source_path, False),
+            ("gt_json", self.gt_json, True),
+            ("images_dir", self.images_dir, False),
+        ]:
+            if must_be_file and not path.is_file():
+                problems.append(f"  {label}: file not found: {path}")
+            if not must_be_file and not path.is_dir():
+                problems.append(f"  {label}: directory not found: {path}")
+        if problems:
+            raise FileNotFoundError(
+                "Config validation failed:\n" + "\n".join(problems))
+
+
+# =============================================================================
+# Lightweight result types
+# =============================================================================
+
+@dataclass(frozen=True)
+class Detection:
+    """A single post-NMS detection, in original-image pixel coordinates."""
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    score: float
+    category_id: int  # 1-indexed COCO category (matches GT JSON)
+
+    @property
+    def xywh(self) -> tuple[float, float, float, float]:
+        return (self.x1, self.y1, self.x2 - self.x1, self.y2 - self.y1)
+
+
+@dataclass
+class PerImageResult:
+    image_id: int
+    file_name: str
+    width: int
+    height: int
+    num_detections: int
+    inference_time_ms: float
+    matched_mean_iou: float | None        # None when no GT/predictions overlap
+
+
+@dataclass
+class BackendResult:
+    name: str
+    model_path: str
+    model_size_mb: float
+    per_image: list[PerImageResult] = field(default_factory=list)
+    coco_predictions: list[dict[str, Any]] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
+# =============================================================================
+# Geometry helpers
+# =============================================================================
+
+def iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Pairwise IoU between two [N,4] and [M,4] xyxy arrays. Returns [N,M]."""
+    if a.size == 0 or b.size == 0:
+        return np.zeros((a.shape[0], b.shape[0]), dtype=np.float32)
+    a_x1, a_y1, a_x2, a_y2 = a[:, 0:1], a[:, 1:2], a[:, 2:3], a[:, 3:4]
+    b_x1, b_y1, b_x2, b_y2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    inter_x1 = np.maximum(a_x1, b_x1)
+    inter_y1 = np.maximum(a_y1, b_y1)
+    inter_x2 = np.minimum(a_x2, b_x2)
+    inter_y2 = np.minimum(a_y2, b_y2)
+    inter_w = np.clip(inter_x2 - inter_x1, 0, None)
+    inter_h = np.clip(inter_y2 - inter_y1, 0, None)
+    inter = inter_w * inter_h
+    area_a = (a_x2 - a_x1) * (a_y2 - a_y1)
+    area_b = (b_x2 - b_x1) * (b_y2 - b_y1)
+    union = area_a + area_b - inter
+    return (inter / np.clip(union, 1e-12, None)).astype(np.float32)
+
+
+def matched_mean_iou(preds_xyxy: np.ndarray,
+                     gt_xyxy: np.ndarray,
+                     iou_threshold: float) -> float | None:
+    """Greedy 1-1 matching, return mean IoU of matched pairs (None if 0)."""
+    if preds_xyxy.size == 0 or gt_xyxy.size == 0:
+        return None
+    iou = iou_xyxy(preds_xyxy, gt_xyxy)
+    matched_ious: list[float] = []
+    used_gt: set[int] = set()
+    pred_order = np.argsort(-iou.max(axis=1))   # best-matching preds first
+    for p in pred_order:
+        candidates = [
+            (iou[p, g], g) for g in range(gt_xyxy.shape[0])
+            if g not in used_gt and iou[p, g] >= iou_threshold
+        ]
+        if not candidates:
+            continue
+        best_iou, best_g = max(candidates, key=lambda t: t[0])
+        used_gt.add(best_g)
+        matched_ious.append(float(best_iou))
+    if not matched_ious:
+        return None
+    return float(np.mean(matched_ious))
+
+
+def hard_nms(boxes: np.ndarray, scores: np.ndarray,
+             iou_threshold: float, top_k: int) -> np.ndarray:
+    """Classic single-class hard NMS. Returns indices kept (sorted by score)."""
+    if boxes.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    order = np.argsort(-scores)
+    keep: list[int] = []
+    while order.size > 0 and len(keep) < top_k:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        ious = iou_xyxy(boxes[i:i + 1], boxes[order[1:]])[0]
+        order = order[1:][ious < iou_threshold]
+    return np.asarray(keep, dtype=np.int64)
+
+
+# =============================================================================
+# Image / GT loading
+# =============================================================================
+
+def load_coco_index(gt_json: Path) -> tuple[COCO, list[dict[str, Any]]]:
+    log.info("Loading COCO ground truth: %s", gt_json)
+    coco = COCO(str(gt_json))
+    img_ids = coco.getImgIds()
+    images = coco.loadImgs(img_ids)
+    images = sorted(images, key=lambda im: im["id"])
+    return coco, images
+
+
+def load_image_rgb(images_dir: Path, file_name: str) -> Image.Image:
+    path = images_dir / file_name
+    if not path.is_file():
+        raise FileNotFoundError(f"Image not found: {path}")
+    return Image.open(path).convert("RGB")
+
+
+def gt_boxes_xyxy(coco: COCO, image_id: int) -> np.ndarray:
+    """Return GT boxes for an image as xyxy float32 [N,4]."""
+    ann_ids = coco.getAnnIds(imgIds=[image_id], iscrowd=False)
+    anns = coco.loadAnns(ann_ids)
+    if not anns:
+        return np.zeros((0, 4), dtype=np.float32)
+    xywh = np.asarray([a["bbox"] for a in anns], dtype=np.float32)
+    xyxy = np.empty_like(xywh)
+    xyxy[:, 0] = xywh[:, 0]
+    xyxy[:, 1] = xywh[:, 1]
+    xyxy[:, 2] = xywh[:, 0] + xywh[:, 2]
+    xyxy[:, 3] = xywh[:, 1] + xywh[:, 3]
+    return xyxy
+
+
+# =============================================================================
+# Backends
+# =============================================================================
+
+class _BackendBase:
+    """Common contract: load(), infer_and_decode(pil_image) -> (Detections, ms)."""
+
+    name: str
+
+    def model_size_mb(self) -> float:
+        raise NotImplementedError
+
+    def infer_and_decode(self, image: Image.Image
+                         ) -> tuple[list[Detection], float]:
+        raise NotImplementedError
+
+
+# ----------------------------- PyTorch backend ------------------------------
+
+class PyTorchBackend(_BackendBase):
+    """Loads qfgaohao MobileNetV2-SSD-Lite .pth + uses its Predictor."""
+
+    name = "PyTorch"
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._predictor = None  # set in load()
+        self._weights_path = cfg.pt_weights
+
+    def load(self) -> None:
+        # qfgaohao's `vision` package must be importable; the user can pass
+        # --source-path; we insert it into sys.path here.
+        if str(self.cfg.source_path) not in sys.path:
+            sys.path.insert(0, str(self.cfg.source_path))
+        try:
+            from vision.ssd.mobilenet_v2_ssd_lite import (
+                create_mobilenetv2_ssd_lite,
+                create_mobilenetv2_ssd_lite_predictor,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Cannot import qfgaohao 'vision' module from "
+                f"{self.cfg.source_path}. Pass --source-path pointing at the "
+                f"qfgaohao pytorch-ssd checkout."
+            ) from exc
+
+        log.info("[PyTorch] Building network …")
+        net = create_mobilenetv2_ssd_lite(self.cfg.num_classes, is_test=True)
+        log.info("[PyTorch] Loading weights: %s", self._weights_path)
+        net.load(str(self._weights_path))
+        net.eval()
+
+        self._predictor = create_mobilenetv2_ssd_lite_predictor(
+            net,
+            candidate_size=self.cfg.candidate_size,
+            nms_method=None,            # default = hard NMS in qfgaohao
+            device=self.cfg.device,
+        )
+        # Override decode hyper-params to match Config.
+        self._predictor.iou_threshold = self.cfg.nms_iou_threshold
+        self._predictor.filter_threshold = self.cfg.score_threshold
+
+    def model_size_mb(self) -> float:
+        return self._weights_path.stat().st_size / (1024.0 * 1024.0)
+
+    def infer_and_decode(self, image: Image.Image
+                         ) -> tuple[list[Detection], float]:
+        if self._predictor is None:
+            raise RuntimeError("PyTorchBackend not loaded; call load() first.")
+
+        np_image = np.asarray(image)  # RGB uint8 HWC
+        t0 = time.perf_counter()
+        # predictor.predict applies transform → forward → decode → NMS
+        boxes, labels, probs = self._predictor.predict(
+            np_image,
+            top_k=self.cfg.max_detections_per_image,
+            prob_threshold=self.cfg.score_threshold,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        if boxes is None or len(boxes) == 0:
+            return [], elapsed_ms
+
+        boxes_np = boxes.detach().cpu().numpy().astype(np.float32)
+        labels_np = labels.detach().cpu().numpy().astype(np.int64)
+        probs_np = probs.detach().cpu().numpy().astype(np.float32)
+
+        detections = [
+            Detection(
+                x1=float(b[0]), y1=float(b[1]),
+                x2=float(b[2]), y2=float(b[3]),
+                score=float(p),
+                category_id=int(l),
+            )
+            for b, l, p in zip(boxes_np, labels_np, probs_np)
+        ]
+        return detections, elapsed_ms
+
+
+# ----------------------------- TFLite backend -------------------------------
+
+class TFLiteBackend(_BackendBase):
+    """Loads a .tflite SSD model; auto-detects post-NMS vs raw output."""
+
+    name = "TFLite"
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._interpreter = None
+        self._input_details: list[dict[str, Any]] = []
+        self._output_details: list[dict[str, Any]] = []
+        self._is_post_nms: bool = False
+        self._priors: np.ndarray | None = None
+        self._mean = np.array([127.0, 127.0, 127.0], dtype=np.float32)
+        self._std = 128.0
+
+    # -- private helpers ----------------------------------------------------
+
+    def _import_interpreter(self):
+        try:
+            from tflite_runtime.interpreter import Interpreter
+            return Interpreter
+        except ImportError:
+            pass
+        try:
+            from tensorflow.lite.python.interpreter import Interpreter
+            return Interpreter
+        except ImportError as exc:
+            raise RuntimeError(
+                "Neither tflite_runtime nor tensorflow is installed. "
+                "Install one: `pip install tflite-runtime`  or  "
+                "`pip install tensorflow`."
+            ) from exc
+
+    def _build_priors(self) -> np.ndarray:
+        """qfgaohao MobileNetV2-SSD-Lite priors at 300×300."""
+        if str(self.cfg.source_path) not in sys.path:
+            sys.path.insert(0, str(self.cfg.source_path))
+        # qfgaohao stores priors in mobilenetv1_ssd_config.priors;
+        # mb2-ssd-lite reuses them.
+        from vision.ssd.config import mobilenetv1_ssd_config as ssd_cfg
+        return ssd_cfg.priors.numpy().astype(np.float32)  # [num_priors,4] cxcywh
+
+    # -- API ----------------------------------------------------------------
+
+    def load(self) -> None:
+        Interpreter = self._import_interpreter()
+        log.info("[TFLite] Loading model: %s", self.cfg.tflite_path)
+        self._interpreter = Interpreter(model_path=str(self.cfg.tflite_path))
+        self._interpreter.allocate_tensors()
+        self._input_details = self._interpreter.get_input_details()
+        self._output_details = self._interpreter.get_output_details()
+
+        # Auto-detect format.
+        # Post-NMS: 4 outputs (boxes, classes, scores, num) with rank 3,2,2,1.
+        # Raw qfgaohao: 2 outputs (scores [1,P,C], boxes [1,P,4]).
+        n_out = len(self._output_details)
+        if n_out == 4:
+            self._is_post_nms = True
+            log.info("[TFLite] Detected post-NMS output format (4 tensors)")
+        elif n_out == 2:
+            self._is_post_nms = False
+            self._priors = self._build_priors()
+            log.info("[TFLite] Detected raw output format (2 tensors); "
+                     "applying decode + NMS in-process")
+        else:
+            raise RuntimeError(
+                f"Unexpected TFLite output count: {n_out}. "
+                f"Expected 4 (post-NMS) or 2 (raw)."
+            )
+
+    def model_size_mb(self) -> float:
+        return self.cfg.tflite_path.stat().st_size / (1024.0 * 1024.0)
+
+    # -- preprocessing -----------------------------------------------------
+
+    def _preprocess(self, image: Image.Image) -> np.ndarray:
+        """Resize → normalize → batch-pack to the input tensor's dtype/layout."""
+        in_det = self._input_details[0]
+        target_h, target_w = in_det["shape"][1], in_det["shape"][2]
+        resized = image.resize(
+            (target_w, target_h), Image.Resampling.BILINEAR)
+        arr = np.asarray(resized, dtype=np.float32)        # HWC RGB
+        arr = (arr - self._mean) / self._std
+        # Most qfgaohao TFLite exports take float32 NHWC.
+        if in_det["dtype"] == np.uint8:
+            # Quantized input — shouldn't happen for FP32 model, but just in case.
+            scale, zero = in_det["quantization"]
+            arr = np.clip(arr / scale + zero, 0, 255).astype(np.uint8)
+        else:
+            arr = arr.astype(np.float32)
+        return np.expand_dims(arr, axis=0)
+
+    # -- inference --------------------------------------------------------
+
+    def infer_and_decode(self, image: Image.Image
+                         ) -> tuple[list[Detection], float]:
+        if self._interpreter is None:
+            raise RuntimeError("TFLiteBackend not loaded; call load() first.")
+
+        orig_w, orig_h = image.size
+        x = self._preprocess(image)
+
+        t0 = time.perf_counter()
+        self._interpreter.set_tensor(self._input_details[0]["index"], x)
+        self._interpreter.invoke()
+        outs = [
+            self._interpreter.get_tensor(d["index"])
+            for d in self._output_details
+        ]
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        if self._is_post_nms:
+            detections = self._decode_post_nms(outs, orig_w, orig_h)
+        else:
+            detections = self._decode_raw(outs, orig_w, orig_h)
+        return detections, elapsed_ms
+
+    # -- decode paths -----------------------------------------------------
+
+    def _decode_post_nms(self, outs: Sequence[np.ndarray],
+                         orig_w: int, orig_h: int) -> list[Detection]:
+        # Standard TF SSD postprocess output order: boxes, classes, scores, num.
+        # Identify by shape since order isn't guaranteed across exports.
+        boxes_t = None
+        classes_t = None
+        scores_t = None
+        num_t = None
+        for o in outs:
+            if o.ndim == 3 and o.shape[-1] == 4:
+                boxes_t = o[0]
+            elif o.ndim == 2:
+                # classes or scores; classes are integer-ish floats, scores ∈ [0,1].
+                if scores_t is None and 0.0 <= o.max() <= 1.0:
+                    scores_t = o[0]
+                else:
+                    classes_t = o[0]
+            elif o.ndim == 1:
+                num_t = int(o[0])
+
+        if boxes_t is None or scores_t is None or classes_t is None:
+            raise RuntimeError(
+                "Could not identify post-NMS outputs by shape.")
+
+        if num_t is None:
+            num_t = int(scores_t.shape[0])
+
+        dets: list[Detection] = []
+        for i in range(num_t):
+            score = float(scores_t[i])
+            if score < self.cfg.score_threshold:
+                continue
+            # boxes come normalized ymin, xmin, ymax, xmax
+            ymin, xmin, ymax, xmax = boxes_t[i]
+            x1 = float(xmin) * orig_w
+            y1 = float(ymin) * orig_h
+            x2 = float(xmax) * orig_w
+            y2 = float(ymax) * orig_h
+            cat = int(classes_t[i]) + 1   # TF labels are 0-indexed → COCO 1-idx
+            dets.append(Detection(x1, y1, x2, y2, score, cat))
+        return dets[: self.cfg.max_detections_per_image]
+
+    def _decode_raw(self, outs: Sequence[np.ndarray],
+                    orig_w: int, orig_h: int) -> list[Detection]:
+        # qfgaohao SSD raw outputs:
+        #   scores [1, num_priors, num_classes]   logits already softmaxed
+        #   boxes  [1, num_priors, 4]             encoded relative to priors
+        # The order between outputs[0] and outputs[1] isn't guaranteed —
+        # identify by last-dim size.
+        assert self._priors is not None
+        if outs[0].shape[-1] == 4:
+            boxes_raw, scores_raw = outs[0][0], outs[1][0]
+        else:
+            scores_raw, boxes_raw = outs[0][0], outs[1][0]
+
+        decoded = self._decode_locations(
+            boxes_raw, self._priors,
+            center_variance=0.1, size_variance=0.2)
+        # convert center cxcywh → xyxy
+        decoded_xyxy = np.empty_like(decoded)
+        decoded_xyxy[:, 0] = decoded[:, 0] - decoded[:, 2] / 2
+        decoded_xyxy[:, 1] = decoded[:, 1] - decoded[:, 3] / 2
+        decoded_xyxy[:, 2] = decoded[:, 0] + decoded[:, 2] / 2
+        decoded_xyxy[:, 3] = decoded[:, 1] + decoded[:, 3] / 2
+        # boxes are normalized [0,1] → scale to orig image
+        decoded_xyxy[:, [0, 2]] *= orig_w
+        decoded_xyxy[:, [1, 3]] *= orig_h
+
+        dets: list[Detection] = []
+        # Per-class NMS, skipping background (class 0).
+        for c in range(1, scores_raw.shape[1]):
+            cls_scores = scores_raw[:, c]
+            keep_mask = cls_scores > self.cfg.score_threshold
+            if not keep_mask.any():
+                continue
+            cls_boxes = decoded_xyxy[keep_mask]
+            cls_s = cls_scores[keep_mask]
+            keep_idx = hard_nms(
+                cls_boxes, cls_s,
+                self.cfg.nms_iou_threshold,
+                top_k=self.cfg.candidate_size,
+            )
+            for i in keep_idx:
+                b = cls_boxes[i]
+                dets.append(Detection(
+                    x1=float(b[0]), y1=float(b[1]),
+                    x2=float(b[2]), y2=float(b[3]),
+                    score=float(cls_s[i]),
+                    category_id=c,
+                ))
+        # Top-k across all classes.
+        dets.sort(key=lambda d: d.score, reverse=True)
+        return dets[: self.cfg.max_detections_per_image]
+
+    @staticmethod
+    def _decode_locations(boxes_raw: np.ndarray, priors: np.ndarray,
+                          center_variance: float, size_variance: float
+                          ) -> np.ndarray:
+        """SSD location decoding (cxcywh)."""
+        cxcy = boxes_raw[:, :2] * center_variance * priors[:, 2:] + priors[:, :2]
+        wh = np.exp(boxes_raw[:, 2:] * size_variance) * priors[:, 2:]
+        return np.concatenate([cxcy, wh], axis=1)
+
+
+# =============================================================================
+# Evaluation orchestration
+# =============================================================================
+
+def evaluate_backend(backend: _BackendBase,
+                     cfg: Config,
+                     coco: COCO,
+                     images: Sequence[Mapping[str, Any]]
+                     ) -> BackendResult:
+    log.info("=== Evaluating backend: %s ===", backend.name)
+    backend.load()
+    result = BackendResult(
+        name=backend.name,
+        model_path=str(
+            cfg.pt_weights if backend.name == "PyTorch" else cfg.tflite_path),
+        model_size_mb=backend.model_size_mb(),
     )
-    return logging.getLogger(__name__)
 
+    for idx, img_meta in enumerate(tqdm(images, desc=backend.name, unit="img")):
+        image_id = int(img_meta["id"])
+        file_name = str(img_meta["file_name"])
+        try:
+            image = load_image_rgb(cfg.images_dir, file_name)
+        except FileNotFoundError as exc:
+            log.warning("Skipping missing image: %s (%s)", file_name, exc)
+            continue
 
-logger = setup_logging()
+        try:
+            detections, elapsed_ms = backend.infer_and_decode(image)
+        except Exception:
+            log.error("Inference failed on %s:\n%s",
+                      file_name, traceback.format_exc())
+            continue
 
+        # COCO predictions list.
+        for d in detections:
+            x, y, w, h = d.xywh
+            result.coco_predictions.append({
+                "image_id": image_id,
+                "category_id": d.category_id,
+                "bbox": [float(x), float(y), float(w), float(h)],
+                "score": float(d.score),
+            })
 
-# ============================================================
-# Detection Metrics (inline; future cleanup: lift to vision_metrics.py
-#                    once a second detection model exists)
-# ============================================================
-
-# Contract pinned to evaluation/common/metrics_definitions.json
-# (vision_metrics.detection block). Any drift here will desync the
-# HTML report's metric interpretation thresholds — see
-# metrics_loader._INTERPRETATION_PRESETS for the resolved presets.
-_DETECTION_METRIC_KEYS: tuple[str, ...] = (
-    'mean_precision',
-    'mean_recall',
-    'mean_f1',
-    'mean_iou',
-    'mAP_0.5',
-    'mAP_0.65',
-    'mAP_0.75',
-    'mAP_0.5_0.95',
-    'num_samples',
-)
-
-
-def calculate_detection_metrics(
-    predictions: Sequence[dict],
-    labels: Any,
-    class_subset: Optional[Iterable[int]] = None,
-) -> dict:
-    """Compute COCO-style detection metrics.
-
-    Args:
-        predictions: List of detection dicts. Each must contain
-            ``{'image_id': int, 'category_id': int, 'bbox': [x,y,w,h], 'score': float}``.
-            ``bbox`` is in pixel xywh format (COCO convention).
-        labels: Path to a COCO-format GT JSON, a dict in that format, or an
-            already-loaded ``pycocotools.coco.COCO`` instance.
-        class_subset: Optional iterable of category_ids to restrict eval to.
-
-    Returns:
-        Dict with the 9 keys defined in ``_DETECTION_METRIC_KEYS``. On error
-        or no-predictions fallback, the metric keys are returned as zeros so
-        the HTML report renders consistently across variants.
-    """
-    try:
-        from pycocotools.coco import COCO
-        from pycocotools.cocoeval import COCOeval
-    except ImportError:
-        logger.warning(
-            "pycocotools not available; returning num_samples-only result"
+        # Per-image matched IoU.
+        pred_xyxy = (
+            np.asarray([[d.x1, d.y1, d.x2, d.y2] for d in detections],
+                       dtype=np.float32)
+            if detections else np.zeros((0, 4), dtype=np.float32)
         )
-        return {'num_samples': _count_gt_images(labels)}
+        gt_xyxy = gt_boxes_xyxy(coco, image_id)
+        mean_iou = matched_mean_iou(
+            pred_xyxy, gt_xyxy, cfg.iou_match_threshold)
 
-    gt_coco = _coerce_to_coco(labels, COCO)
-    num_samples = len(gt_coco.getImgIds())
+        result.per_image.append(PerImageResult(
+            image_id=image_id,
+            file_name=file_name,
+            width=int(img_meta.get("width", image.width)),
+            height=int(img_meta.get("height", image.height)),
+            num_detections=len(detections),
+            inference_time_ms=elapsed_ms,
+            matched_mean_iou=mean_iou,
+        ))
 
-    if not predictions:
-        logger.warning("No predictions provided; returning zeroed metrics")
-        return _empty_detection_result(num_samples)
-
-    try:
-        coco_dt = gt_coco.loadRes(list(predictions))
-    except Exception as e:
-        logger.error(f"Failed to load detections into pycocotools: {e}")
-        return _empty_detection_result(num_samples)
-
-    coco_eval = COCOeval(gt_coco, coco_dt, 'bbox')
-    if class_subset is not None:
-        coco_eval.params.catIds = list(class_subset)
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
-
-    precision_05 = _mean_precision_at_iou_05(coco_eval)
-    recall_avg = _mean_recall_across_ious(coco_eval)
-    f1 = _harmonic_mean(precision_05, recall_avg)
-    mean_iou = _mean_iou_from_cocoeval(coco_eval, gt_coco)
-
-    result = {
-        'mean_precision': float(precision_05),
-        'mean_recall': float(recall_avg),
-        'mean_f1': float(f1),
-        'mean_iou': float(mean_iou),
-        'mAP_0.5': float(_ap_at_iou(coco_eval, 0.5)),
-        'mAP_0.65': float(_ap_at_iou(coco_eval, 0.65)),
-        'mAP_0.75': float(_ap_at_iou(coco_eval, 0.75)),
-        'mAP_0.5_0.95': float(coco_eval.stats[0]),
-        'num_samples': num_samples,
-    }
-
-    missing = set(_DETECTION_METRIC_KEYS) - set(result.keys())
-    if missing:
-        raise RuntimeError(
-            f"Detection metrics contract violation: missing keys {missing}"
-        )
     return result
 
 
-def generate_per_image_detection_results(
-    predictions: Sequence[dict],
-    gt_coco_or_path: Any,
-    latencies: Optional[Sequence[float]] = None,
-) -> list[dict]:
-    """Build per-image rows for the HTML report.
+# =============================================================================
+# Metrics
+# =============================================================================
 
-    Returns rows ordered by ascending image_id, each row starting with
-    ``image_index`` (0-based dense index) for stable HTML rendering.
-    """
-    try:
-        from pycocotools.coco import COCO
-    except ImportError:
-        return []
-
-    gt_coco = _coerce_to_coco(gt_coco_or_path, COCO)
-
-    # Group predictions by image_id.
-    preds_by_img: dict[int, list[dict]] = {}
-    for det in predictions:
-        img_id = det.get('image_id')
-        if img_id is None:
-            continue
-        preds_by_img.setdefault(int(img_id), []).append(det)
-
-    rows: list[dict] = []
-    image_ids = sorted(gt_coco.getImgIds())
-    for idx, image_id in enumerate(image_ids):
-        preds = preds_by_img.get(image_id, [])
-        gt_ann_ids = gt_coco.getAnnIds(imgIds=[image_id])
-        row = {
-            'image_index': idx,
-            'image_id': image_id,
-            'num_predictions': len(preds),
-            'num_gt': len(gt_ann_ids),
-            'max_score': float(
-                max((p.get('score', 0.0) for p in preds), default=0.0)
-            ),
-        }
-        if latencies is not None and idx < len(latencies):
-            row['latency_ms'] = float(latencies[idx])
-        rows.append(row)
-    return rows
-
-
-# ---------- Detection helpers (underscore-prefixed; not part of public API) ----------
-
-def _coerce_to_coco(labels: Any, COCO) -> Any:
-    """Accept a path, dict, or COCO instance; return a COCO instance."""
-    if hasattr(labels, 'getImgIds') and hasattr(labels, 'getAnnIds'):
-        return labels
-    if isinstance(labels, (str, Path)):
-        return COCO(str(labels))
-    if isinstance(labels, dict):
-        import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.json', delete=False
-        ) as tmp:
-            json.dump(labels, tmp)
-            tmp_path = tmp.name
-        return COCO(tmp_path)
-    raise TypeError(f"Cannot coerce {type(labels)} to pycocotools.COCO")
-
-
-def _count_gt_images(labels: Any) -> int:
-    """Best-effort GT image count without requiring pycocotools."""
-    try:
-        if hasattr(labels, 'getImgIds'):
-            return len(labels.getImgIds())
-        if isinstance(labels, (str, Path)):
-            with open(labels) as f:
-                data = json.load(f)
-            return len(data.get('images', []))
-        if isinstance(labels, dict):
-            return len(labels.get('images', []))
-    except Exception:
-        pass
-    return 0
-
-
-def _empty_detection_result(num_samples: int) -> dict:
-    """Zeroed result used on no-predictions/error fallback."""
+def _latency_stats(per_image: Sequence[PerImageResult],
+                   warmup: int) -> dict[str, float]:
+    """Return {mean, std, p50, p90, p95, p99} in ms over warm samples."""
+    samples = [p.inference_time_ms for p in per_image[warmup:]]
+    if not samples:
+        return {"mean_ms": 0.0, "std_ms": 0.0, "p50_ms": 0.0,
+                "p90_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0}
+    arr = np.asarray(samples, dtype=np.float64)
     return {
-        'mean_precision': 0.0,
-        'mean_recall': 0.0,
-        'mean_f1': 0.0,
-        'mean_iou': 0.0,
-        'mAP_0.5': 0.0,
-        'mAP_0.65': 0.0,
-        'mAP_0.75': 0.0,
-        'mAP_0.5_0.95': 0.0,
-        'num_samples': num_samples,
+        "mean_ms": float(arr.mean()),
+        "std_ms":  float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
+        "p50_ms":  float(np.percentile(arr, 50)),
+        "p90_ms":  float(np.percentile(arr, 90)),
+        "p95_ms":  float(np.percentile(arr, 95)),
+        "p99_ms":  float(np.percentile(arr, 99)),
+        "warmup_excluded": float(warmup),
+        "n_samples": float(arr.size),
     }
 
 
-def _ap_at_iou(coco_eval, iou_threshold: float) -> float:
-    """Mean AP at a specific IoU threshold (mean over recall thresholds and
-    classes), pulled from COCOeval.eval['precision'] of shape
-    [T, R, K, A, M] where T=iou_thrs, R=recall_thrs, K=classes, A=areas
-    (0=all), M=max_dets (-1=last). argmin against the iouThrs grid handles
-    non-standard thresholds like 0.65.
-    """
-    if not hasattr(coco_eval, 'eval') or 'precision' not in coco_eval.eval:
-        return 0.0
-    iou_thrs = coco_eval.params.iouThrs
-    t_idx = int(np.argmin(np.abs(iou_thrs - iou_threshold)))
-    precision = coco_eval.eval['precision'][t_idx, :, :, 0, -1]  # [R, K]
-    valid = precision[precision > -1]
-    if valid.size == 0:
-        return 0.0
-    return float(np.mean(valid))
+def compute_metrics(result: BackendResult,
+                    coco_gt: COCO,
+                    cfg: Config) -> None:
+    """Populate result.metrics in place."""
+    log.info("Computing COCO mAP for %s …", result.name)
+    if not result.coco_predictions:
+        log.warning("%s produced zero detections — mAP will be 0.", result.name)
+        coco_stats: dict[str, float] = {k: 0.0 for k in _COCO_STAT_KEYS}
+        per_class_ap: dict[str, float] = {}
+    else:
+        coco_dt = coco_gt.loadRes(result.coco_predictions)
+        coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+        coco_eval.params.imgIds = [p.image_id for p in result.per_image]
+        coco_eval.evaluate()
+        coco_eval.accumulate()
+        coco_eval.summarize()
+        coco_stats = dict(zip(_COCO_STAT_KEYS, [float(s) for s in coco_eval.stats]))
+        per_class_ap = _per_class_ap(coco_eval, coco_gt)
+
+    # Per-image matched-IoU summary.
+    matched_ious = [
+        p.matched_mean_iou for p in result.per_image
+        if p.matched_mean_iou is not None
+    ]
+    mean_matched_iou = float(np.mean(matched_ious)) if matched_ious else 0.0
+
+    result.metrics = {
+        "model_size_mb": result.model_size_mb,
+        "num_images": len(result.per_image),
+        "num_predictions": len(result.coco_predictions),
+        "coco": coco_stats,
+        "per_class_AP_at_IoU_0.5_0.95": per_class_ap,
+        "mean_matched_iou_at_0.5": mean_matched_iou,
+        "n_images_with_matches": float(len(matched_ious)),
+        "latency": _latency_stats(result.per_image, cfg.warmup_images),
+    }
 
 
-def _mean_precision_at_iou_05(coco_eval) -> float:
-    """Mean precision averaged over recall thresholds, at IoU=0.5
-    (binary-preset convention from metrics_definitions.json)."""
-    return _ap_at_iou(coco_eval, 0.5)
+# pycocotools.COCOeval.summarize order:
+_COCO_STAT_KEYS: Final[tuple[str, ...]] = (
+    "mAP_0.5_0.95",
+    "mAP_0.5",
+    "mAP_0.75",
+    "mAP_small",
+    "mAP_medium",
+    "mAP_large",
+    "AR_max1",
+    "AR_max10",
+    "AR_max100",
+    "AR_small",
+    "AR_medium",
+    "AR_large",
+)
 
 
-def _mean_recall_across_ious(coco_eval) -> float:
-    """Mean recall averaged across the full IoU sweep [0.5:0.95].
-
-    Asymmetry with mean_precision (which is at IoU=0.5 only) is intentional:
-    recall@0.5 saturates quickly on quantized models and obscures
-    localization degradation, so we use the sweep as the more stable summary.
-    """
-    if not hasattr(coco_eval, 'eval') or 'recall' not in coco_eval.eval:
-        return 0.0
-    recall = coco_eval.eval['recall'][:, :, 0, -1]  # [T, K]
-    valid = recall[recall > -1]
-    if valid.size == 0:
-        return 0.0
-    return float(np.mean(valid))
-
-
-def _harmonic_mean(a: float, b: float) -> float:
-    """Harmonic mean with zero-safety (returns 0 when both inputs are 0)."""
-    if a + b <= 0:
-        return 0.0
-    return 2.0 * a * b / (a + b)
-
-
-def _mean_iou_from_cocoeval(coco_eval, gt_coco) -> float:
-    """Average best-match IoU per GT annotation across all (img_id, cat_id)
-    cells in ``coco_eval.ious``. GTs with no detection at their cell count
-    in the denominator but contribute 0 to the numerator.
-    """
-    if not hasattr(coco_eval, 'ious') or not coco_eval.ious:
-        return 0.0
-
-    total_iou = 0.0
-    total_gt = 0
-    img_ids = coco_eval.params.imgIds
+def _per_class_ap(coco_eval: COCOeval, coco_gt: COCO) -> dict[str, float]:
+    """Return AP @[.5:.95] per category, keyed by category name."""
+    # precision shape: [T, R, K, A, M] = [10 IoUs, 101 recalls, K classes, 4 areas, 3 maxDets]
+    precision = coco_eval.eval.get("precision")
+    if precision is None:
+        return {}
     cat_ids = coco_eval.params.catIds
-
-    for img_id in img_ids:
-        for cat_id in cat_ids:
-            ann_ids = gt_coco.getAnnIds(imgIds=[img_id], catIds=[cat_id])
-            num_gt_here = len(ann_ids)
-            if num_gt_here == 0:
-                continue
-            ious = coco_eval.ious.get((img_id, cat_id), [])
-            if len(ious) == 0:
-                total_gt += num_gt_here
-                continue
-            ious_arr = np.asarray(ious)
-            if ious_arr.size == 0:
-                total_gt += num_gt_here
-                continue
-            # rows=detections, cols=GTs; best per GT = max along axis=0.
-            if ious_arr.ndim == 2:
-                best_per_gt = ious_arr.max(axis=0)
-            else:
-                best_per_gt = ious_arr
-            total_iou += float(best_per_gt.sum())
-            total_gt += num_gt_here
-
-    if total_gt == 0:
-        return 0.0
-    return total_iou / total_gt
-
-
-# ============================================================
-# Custom Dataset for VOC Detection (flat directory structure)
-# ============================================================
-
-class VOCDetectionDataset(Dataset):
-    """VOC-as-COCO detection dataset.
-
-    Reads images keyed off ``file_name`` in the GT COCO JSON, looking under
-    both the data_path root and ``data_path/JPEGImages/`` (the standard VOC
-    layout). Returns ``(image_tensor [3, H, W] float32 in [0,1], image_id,
-    original_width, original_height)``. Normalization is deferred to the
-    evaluation functions so the same dataset can feed both the PyTorch and
-    ExecuTorch paths without diverging tensor pipelines.
-    """
-
-    def __init__(self, data_path: Any, gt_coco, image_size: int = 300):
-        self.data_path = Path(data_path)
-        self.gt_coco = gt_coco
-        self.image_size = image_size
-        self.image_ids = sorted(gt_coco.getImgIds())
-        self.image_info = {
-            img_id: gt_coco.loadImgs([img_id])[0]
-            for img_id in self.image_ids
-        }
-
-    def __len__(self) -> int:
-        return len(self.image_ids)
-
-    def __getitem__(self, idx: int):
-        image_id = self.image_ids[idx]
-        info = self.image_info[image_id]
-        file_name = info['file_name']
-
-        # VOC2012-as-COCO emits bare filenames (e.g. "2008_000008.jpg") that
-        # live under JPEGImages/. Try the root first in case the adapter
-        # included the subdir.
-        candidates = [
-            self.data_path / file_name,
-            self.data_path / 'JPEGImages' / file_name,
-        ]
-        img_path = next((p for p in candidates if p.exists()), None)
-        if img_path is None:
-            raise FileNotFoundError(
-                f"Image {file_name} not found in {self.data_path} or "
-                f"{self.data_path / 'JPEGImages'}"
-            )
-
-        pil_image = Image.open(img_path).convert('RGB')
-        original_width, original_height = pil_image.size
-
-        # Resize to the model's expected input. Done here (not in a
-        # torchvision transform) so the resized dimensions are deterministic
-        # and aligned with the priors' implicit coordinate space.
-        pil_image = pil_image.resize(
-            (self.image_size, self.image_size), Image.BILINEAR
-        )
-
-        arr = np.asarray(pil_image, dtype=np.float32) / 255.0
-        tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-
-        return tensor, image_id, original_width, original_height
-
-
-# ============================================================
-# Dataset Loading
-# ============================================================
-
-def _detection_collate_fn(batch):
-    """Stack image tensors; keep image_ids and original sizes as lists.
-
-    DataLoader's default collate would try to tensorize image_ids and sizes,
-    which is unnecessary and brittle when batch_size=1.
-    """
-    images = torch.stack([item[0] for item in batch], dim=0)
-    image_ids = [item[1] for item in batch]
-    widths = [item[2] for item in batch]
-    heights = [item[3] for item in batch]
-    return images, image_ids, widths, heights
-
-
-def create_dataloader(
-    data_path: Any,
-    gt_coco_json_path: Any,
-    image_size: int = 300,
-    batch_size: int = 1,
-    num_workers: int = 4,
-):
-    """Build the VOC-as-COCO dataloader.
-
-    Signature deviates from mobile_net_v1's ``create_dataloader`` (which is
-    classification-shaped: ``data_path, batch_size, num_workers``) because
-    detection requires GT enumeration up front to establish stable
-    image_id ordering for COCOeval. This deviation is documented in the
-    submission README under Scope & Deviations.
-    """
-    try:
-        from pycocotools.coco import COCO
-    except ImportError as e:
-        raise ImportError(
-            "pycocotools is required for detection evaluation. "
-            "Install with: pip install pycocotools"
-        ) from e
-
-    logger.info(f"Loading GT COCO annotations from {gt_coco_json_path}")
-    gt_coco = COCO(str(gt_coco_json_path))
-
-    logger.info(f"Loading VOC images from {data_path}")
-    dataset = VOCDetectionDataset(
-        data_path, gt_coco, image_size=image_size
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=_detection_collate_fn,
-    )
-
-    logger.info(
-        f"Dataset loaded: {len(dataset)} images, "
-        f"{len(gt_coco.getCatIds())} categories"
-    )
-    return dataloader, dataset, gt_coco
-
-
-# ============================================================
-# Model Loading
-# ============================================================
-
-def get_file_size_mb(path: Any) -> float:
-    """File size in megabytes; returns 0 for missing files (mirrors V1)."""
-    path_obj = Path(path)
-    if path_obj.exists():
-        return path_obj.stat().st_size / (1024 * 1024)
-    return 0
-
-
-def _ensure_qfgaohao_on_path(qfgaohao_repo_path: Any) -> None:
-    """Idempotently prepend the qfgaohao repo to sys.path."""
-    repo_path = Path(qfgaohao_repo_path).resolve()
-    if str(repo_path) not in sys.path:
-        sys.path.insert(0, str(repo_path))
-
-
-def load_pytorch_model(
-    model_path: Any,
-    qfgaohao_repo_path: Any,
-    num_classes: int = 21,
-    device: str = 'cpu',
-):
-    """Load a qfgaohao MobileNetV2-SSD-Lite checkpoint.
-
-    Handles the two common pickle shapes:
-      - Full ``nn.Module`` (what the user has at
-        ``model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth``): returned
-        as-is after ``.eval()``.
-      - state_dict: load into a freshly constructed module.
-
-    ``is_test`` stays False so ``forward()`` returns raw
-    ``(confidences, locations)``; decoding is done Python-side in
-    ``decode_ssd_predictions`` for symmetry with the ExecuTorch path.
-    """
-    logger.info(f"Loading PyTorch model from {model_path}")
-    _ensure_qfgaohao_on_path(qfgaohao_repo_path)
-
-    try:
-        try:
-            ckpt = torch.load(
-                str(model_path), map_location=device, weights_only=False
-            )
-        except TypeError:
-            # Older torch without weights_only kwarg.
-            ckpt = torch.load(str(model_path), map_location=device)
-
-        if isinstance(ckpt, torch.nn.Module):
-            model = ckpt
-        elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
-            from vision.ssd.mobilenetv2_ssd_lite import (
-                create_mobilenetv2_ssd_lite,
-            )
-            model = create_mobilenetv2_ssd_lite(num_classes, is_test=False)
-            model.load_state_dict(ckpt['state_dict'])
-        else:
-            logger.error(
-                "Unsupported checkpoint format — expected full nn.Module "
-                "or dict with 'state_dict'."
-            )
-            return None
-
-        model.eval()
-        return model
-    except Exception as e:
-        logger.error(f"Failed to load PyTorch model: {e}")
-        return None
-
-
-def load_executorch_model(model_path: Any):
-    """Load an ExecuTorch .pte; mirrors mobile_net_v1/evaluate.py line 300."""
-    logger.info(f"Loading ExecuTorch model from {model_path}")
-    try:
-        from executorch.extension.pybindings.portable_lib import (
-            _load_for_executorch,
-        )
-    except ImportError:
-        logger.error(
-            "ExecuTorch not available. Install executorch to evaluate "
-            ".pte models."
-        )
-        return None
-
-    model_path = Path(model_path)
-    ptd_path = model_path.with_suffix('.pte').parent / (
-        f"{model_path.stem}_constants.ptd"
-    )
-
-    try:
-        if ptd_path.exists():
-            logger.info(f"Found PTD file: {ptd_path.name}")
-            program = _load_for_executorch(
-                str(model_path), data_path=str(ptd_path)
-            )
-        else:
-            logger.info("No PTD file found, loading PTE only")
-            program = _load_for_executorch(str(model_path))
-        logger.info(f"ExecuTorch model loaded: {model_path.name}")
-        return program
-    except Exception as e:
-        logger.error(f"Failed to load ExecuTorch model: {e}")
-        return None
-
-
-# ============================================================
-# SSD Post-processing (priors-based decode + per-class NMS)
-# ============================================================
-
-def _load_priors_and_boxutils(qfgaohao_repo_path: Any):
-    """Import qfgaohao's MobileNetV1-SSD prior config and box_utils.
-
-    MobileNetV2-SSD-Lite in qfgaohao's repo shares the same prior
-    configuration as MobileNetV1-SSD (300x300 input, 6 feature maps,
-    matching aspect ratios), so importing ``mobilenetv1_ssd_config`` for
-    the priors is correct. If this assumption ever breaks (e.g., the repo
-    grows a dedicated mv2 config), this is the single point of failure.
-    """
-    _ensure_qfgaohao_on_path(qfgaohao_repo_path)
-    from vision.ssd.config import mobilenetv1_ssd_config
-    from vision.utils import box_utils
-    return mobilenetv1_ssd_config.priors, box_utils
-
-
-def decode_ssd_predictions(
-    confidences: torch.Tensor,
-    locations: torch.Tensor,
-    priors: torch.Tensor,
-    box_utils,
-    original_width: int,
-    original_height: int,
-    decoder_config: dict,
-    num_classes: int = 21,
-    image_id: Optional[int] = None,
-) -> list[dict]:
-    """Apply softmax + prior-based decode + per-class NMS to one image's
-    raw SSD output. Returns COCO-format detection dicts in pixel xywh.
-
-    Args:
-        confidences: ``[num_priors, num_classes]`` raw logits (no batch dim).
-        locations: ``[num_priors, 4]`` center-form deltas (no batch dim).
-        priors: ``[num_priors, 4]`` center-form prior boxes, normalized.
-        box_utils: imported ``vision.utils.box_utils`` module.
-        original_width / original_height: ints — for denormalizing predictions
-            into the same pixel coordinate space as the GT bboxes.
-        decoder_config: dict with keys ``score_threshold``,
-            ``nms_iou_threshold``, ``max_detections_per_image``,
-            ``candidate_size``, ``center_variance``, ``size_variance``.
-        num_classes: total class count including background (21 for VOC).
-        image_id: image_id to attach to every output detection.
-    """
-    score_threshold = decoder_config.get('score_threshold', 0.01)
-    iou_threshold = decoder_config.get('nms_iou_threshold', 0.45)
-    candidate_size = decoder_config.get('candidate_size', 200)
-    max_detections = decoder_config.get('max_detections_per_image', 100)
-    center_variance = decoder_config.get('center_variance', 0.1)
-    size_variance = decoder_config.get('size_variance', 0.2)
-
-    confidences = confidences.detach().cpu()
-    locations = locations.detach().cpu()
-
-    scores = F.softmax(confidences, dim=1)
-
-    # Prior-based decode: center-form normalized boxes.
-    boxes_center = box_utils.convert_locations_to_boxes(
-        locations, priors, center_variance, size_variance
-    )
-    boxes_corner = box_utils.center_form_to_corner_form(boxes_center)
-
-    detections: list[dict] = []
-    img_id_int = int(image_id) if image_id is not None else 0
-
-    # Class 0 is background — skip it.
-    for class_id in range(1, num_classes):
-        class_scores = scores[:, class_id]
-        mask = class_scores > score_threshold
-        if not mask.any():
-            continue
-
-        class_boxes = boxes_corner[mask]
-        class_scores_filtered = class_scores[mask]
-
-        # Stack [boxes | score] for hard_nms (qfgaohao's expected shape).
-        box_probs = torch.cat(
-            [class_boxes, class_scores_filtered.unsqueeze(1)], dim=1
-        )
-        box_probs = box_utils.hard_nms(
-            box_probs,
-            iou_threshold=iou_threshold,
-            top_k=-1,
-            candidate_size=candidate_size,
-        )
-
-        for det in box_probs:
-            x1 = float(det[0]) * original_width
-            y1 = float(det[1]) * original_height
-            x2 = float(det[2]) * original_width
-            y2 = float(det[3]) * original_height
-            score = float(det[4])
-            # COCO bbox: [x, y, width, height] in pixels.
-            width = max(x2 - x1, 0.0)
-            height = max(y2 - y1, 0.0)
-            detections.append({
-                'image_id': img_id_int,
-                'category_id': int(class_id),
-                'bbox': [x1, y1, width, height],
-                'score': score,
-            })
-
-    detections.sort(key=lambda d: d['score'], reverse=True)
-    return detections[:max_detections]
-
-
-# ============================================================
-# Evaluation Functions
-# ============================================================
-
-def _qfgaohao_normalize(
-    image_tensor: torch.Tensor,
-    normalize_mean: Sequence[float],
-    normalize_std: Sequence[float],
-) -> torch.Tensor:
-    """Apply qfgaohao's ``(x - 127) / 128`` normalization.
-
-    With ``image_tensor`` in [0, 1] float, this is equivalent to
-    ``(255*x - 127) / 128``, reproduced via ToTensor + Normalize(mean=127/255,
-    std=128/255). The config supplies mean=0.4980 (=127/255) and
-    std=0.5020 (=128/255), reproducing qfgaohao's original within ~4e-5.
-    """
-    mean = torch.tensor(
-        list(normalize_mean), dtype=image_tensor.dtype
-    ).view(1, 3, 1, 1)
-    std = torch.tensor(
-        list(normalize_std), dtype=image_tensor.dtype
-    ).view(1, 3, 1, 1)
-    return (image_tensor - mean) / std
-
-
-def evaluate_pytorch_model(
-    model,
-    dataloader,
-    priors: torch.Tensor,
-    box_utils,
-    decoder_config: dict,
-    normalize_mean: Sequence[float],
-    normalize_std: Sequence[float],
-    num_classes: int = 21,
-    max_samples: Optional[int] = None,
-) -> dict:
-    """Evaluate the qfgaohao PyTorch model with Python-side decoding."""
-    logger.info("Starting PyTorch model evaluation...")
-
-    all_predictions: list[dict] = []
-    timer = InferenceTimer()
-    samples_processed = 0
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            if max_samples is not None and samples_processed >= max_samples:
-                break
-
-            images, image_ids, widths, heights = batch
-            images_norm = _qfgaohao_normalize(
-                images, normalize_mean, normalize_std
-            )
-
-            with timer:
-                outputs = model(images_norm)
-
-            # qfgaohao with is_test=False returns (confidences, locations).
-            if isinstance(outputs, (tuple, list)) and len(outputs) == 2:
-                confidences_batch, locations_batch = outputs
-            else:
-                logger.error(
-                    f"Unexpected PyTorch output shape: {type(outputs).__name__}; "
-                    f"expected (confidences, locations) tuple"
-                )
-                continue
-
-            for i in range(images.shape[0]):
-                if (max_samples is not None
-                        and samples_processed >= max_samples):
-                    break
-                dets = decode_ssd_predictions(
-                    confidences_batch[i],
-                    locations_batch[i],
-                    priors,
-                    box_utils,
-                    widths[i],
-                    heights[i],
-                    decoder_config,
-                    num_classes=num_classes,
-                    image_id=image_ids[i],
-                )
-                all_predictions.extend(dets)
-                samples_processed += 1
-
-            if (batch_idx + 1) % 10 == 0:
-                logger.info(f"Processed {samples_processed} samples...")
-
-    logger.info(
-        f"PyTorch evaluation complete: {samples_processed} samples, "
-        f"{len(all_predictions)} total detections"
-    )
-    return {
-        'predictions': all_predictions,
-        'samples_processed': samples_processed,
-        'latency': timer.get_stats(),
-    }
-
-
-def evaluate_executorch_model(
-    program,
-    dataloader,
-    priors: torch.Tensor,
-    box_utils,
-    decoder_config: dict,
-    normalize_mean: Sequence[float],
-    normalize_std: Sequence[float],
-    num_classes: int = 21,
-    max_samples: Optional[int] = None,
-) -> dict:
-    """Evaluate an ExecuTorch .pte with the same decoder as the PyTorch path."""
-    logger.info("Starting ExecuTorch model evaluation...")
-
-    all_predictions: list[dict] = []
-    timer = InferenceTimer()
-    samples_processed = 0
-
-    for batch_idx, batch in enumerate(dataloader):
-        if max_samples is not None and samples_processed >= max_samples:
-            break
-
-        images, image_ids, widths, heights = batch
-        images_norm = _qfgaohao_normalize(
-            images, normalize_mean, normalize_std
-        )
-
-        for i in range(images.shape[0]):
-            if max_samples is not None and samples_processed >= max_samples:
-                break
-
-            img_input = images_norm[i:i + 1]
-
-            with timer:
-                outputs = program.forward((img_input,))
-
-            # is_test=False export emits (confidences, locations); both
-            # paths must agree for parity to be meaningful.
-            if isinstance(outputs, (tuple, list)) and len(outputs) >= 2:
-                confidences = outputs[0]
-                locations = outputs[1]
-            else:
-                logger.error(
-                    f"Unexpected ExecuTorch output shape: "
-                    f"{type(outputs).__name__}, "
-                    f"len="
-                    f"{len(outputs) if hasattr(outputs, '__len__') else '?'}"
-                )
-                samples_processed += 1
-                continue
-
-            # Strip batch dim if the PTE preserved it.
-            if confidences.dim() == 3:
-                confidences = confidences[0]
-            if locations.dim() == 3:
-                locations = locations[0]
-
-            dets = decode_ssd_predictions(
-                confidences,
-                locations,
-                priors,
-                box_utils,
-                widths[i],
-                heights[i],
-                decoder_config,
-                num_classes=num_classes,
-                image_id=image_ids[i],
-            )
-            all_predictions.extend(dets)
-            samples_processed += 1
-
-        if (batch_idx + 1) % 10 == 0:
-            logger.info(f"Processed {samples_processed} samples...")
-
-    logger.info(
-        f"ExecuTorch evaluation complete: {samples_processed} samples, "
-        f"{len(all_predictions)} total detections"
-    )
-    return {
-        'predictions': all_predictions,
-        'samples_processed': samples_processed,
-        'latency': timer.get_stats(),
-    }
-
-
-# ============================================================
-# Config helpers
-# ============================================================
-
-def _resolve_path(path_str: Any, toolkit_root: Path) -> Path:
-    """Resolve a config path relative to the toolkit root.
-
-    Anchoring at toolkit root (not the config file's directory) matches
-    the convention the export pipeline uses, so e.g.
-    ``../model_sources/MobileNetV2/...`` in the config resolves to
-    ``<project_root>/model_sources/MobileNetV2/...`` regardless of where
-    the config file itself lives (originally next to evaluate.py, now in
-    ``export/configs/vision/``).
-
-    Absolute paths and ``~``-paths pass through unchanged.
-    """
-    p = Path(str(path_str)).expanduser()
-    if p.is_absolute():
-        return p
-    return (toolkit_root / p).resolve()
-
-
-def _load_config(config_path: Path) -> dict:
-    """Read and minimally validate the V2-SSD config file."""
-    with open(config_path) as f:
-        config = json.load(f)
-
-    required_top = ['model', 'evaluation']
-    missing = [k for k in required_top if k not in config]
-    if missing:
-        raise ValueError(f"Config missing required top-level keys: {missing}")
-
-    eval_block = config['evaluation']
-    for required_sub in ('dataset', 'decoder', 'output', 'backends'):
-        if required_sub not in eval_block:
-            raise ValueError(
-                f"Config 'evaluation' block missing required key: {required_sub}"
-            )
-
-    if not eval_block.get('enabled', True):
-        logger.warning(
-            "evaluation.enabled is False — running anyway because the "
-            "evaluator was invoked explicitly"
-        )
-    return config
-
-
-# ============================================================
-# Main Evaluation Pipeline
-# ============================================================
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description='Evaluate MobileNetV2-SSD-Lite Detection Model'
-    )
-    # Default config lives at executorch-toolkit/export/configs/vision/.
-    # __file__ is at executorch-toolkit/evaluation/mobilenetv2/evaluate.py,
-    # so parents[2] = executorch-toolkit/ (the toolkit root).
-    _toolkit_root = Path(__file__).resolve().parents[2]
-    _default_config = (
-        _toolkit_root / 'export' / 'configs' / 'vision'
-        / 'config_mobile_net_v2_ssd.json'
-    )
-    parser.add_argument(
-        '--config', type=str, default=str(_default_config),
-        help='Path to the configuration JSON file',
-    )
-    parser.add_argument(
-        '--max-samples', type=int, default=None,
-        help='Maximum number of samples to evaluate (default: all)',
-    )
-    parser.add_argument(
-        '--skip-pytorch', action='store_true',
-        help='Skip PyTorch baseline evaluation',
-    )
-    parser.add_argument(
-        '--skip-executorch', action='store_true',
-        help='Skip ExecuTorch model evaluation',
-    )
-    parser.add_argument(
-        '--generate-report', action='store_true', default=True,
-        help='Generate HTML report after evaluation',
-    )
-    args = parser.parse_args()
-
-    # ----- Load config -----
-    config_path = Path(args.config).resolve()
-    # Toolkit root is the anchor for relative paths inside the config.
-    # __file__ at executorch-toolkit/evaluation/mobilenetv2/evaluate.py
-    # → parents[2] = executorch-toolkit/.
-    toolkit_root = Path(__file__).resolve().parents[2]
-    logger.info(f"Loading config from {config_path}")
-    logger.info(f"Toolkit root (path anchor): {toolkit_root}")
-    config = _load_config(config_path)
-
-    model_cfg = config['model']
-    eval_cfg = config['evaluation']
-    dataset_cfg = eval_cfg['dataset']
-    decoder_cfg = eval_cfg['decoder']
-    output_cfg = eval_cfg['output']
-    backends_cfg = eval_cfg['backends']
-    report_cfg = eval_cfg.get('report', {})
-
-    # ----- Resolve paths -----
-    data_path = _resolve_path(dataset_cfg['data_path'], toolkit_root)
-    gt_coco_json = _resolve_path(dataset_cfg['gt_coco_json'], toolkit_root)
-    pytorch_model_path = _resolve_path(
-        model_cfg['model_path'], toolkit_root
-    )
-    qfgaohao_repo_path = _resolve_path(
-        model_cfg['model_sources_repo_path'], toolkit_root
-    )
-    results_dir = _resolve_path(output_cfg['results_dir'], toolkit_root)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    # ----- Detection params -----
-    num_classes = int(model_cfg.get('num_classes', 21))
-    class_names = list(dataset_cfg.get('class_names', []))
-    normalize_mean = list(
-        model_cfg.get('normalize_mean', [0.4980, 0.4980, 0.4980])
-    )
-    normalize_std = list(
-        model_cfg.get('normalize_std', [0.5020, 0.5020, 0.5020])
-    )
-    image_size = int(decoder_cfg.get('image_size', 300))
-    batch_size = int(dataset_cfg.get('batch_size', 1))
-    num_workers = int(dataset_cfg.get('num_workers', 4))
-    primary_metric = eval_cfg.get('primary_metric', 'mAP_0.5_0.95')
-
-    # ----- Build dataloader -----
-    dataloader, dataset, gt_coco = create_dataloader(
-        data_path,
-        gt_coco_json,
-        image_size=image_size,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-
-    # ----- Load priors + box_utils once -----
-    priors, box_utils = _load_priors_and_boxutils(qfgaohao_repo_path)
-
-    # ----- System info & results dict -----
-    logger.info("Collecting system information...")
-    system_info = get_system_info()
-
-    # Top-level primary_metric threads through metrics_loader's
-    # get_result_primary_metric() priority chain so the HTML report
-    # interprets mAP_0.5_0.95 (not task_config's default of mean_f1).
-    results: dict = {
-        'model_name': 'MobileNetV2-SSD-Lite',
-        'task': 'detection',
-        'primary_metric': primary_metric,
-        'timestamp': datetime.now().isoformat(),
-        'dataset': {
-            'path': str(data_path),
-            'gt_coco_json': str(gt_coco_json),
-            'num_samples': len(dataset),
-            'num_classes': num_classes,
-            'class_names': class_names,
-            'samples_evaluated': 0,
+    cats = {c["id"]: c["name"] for c in coco_gt.loadCats(cat_ids)}
+    out: dict[str, float] = {}
+    for k, cat_id in enumerate(cat_ids):
+        # all areas (idx 0), maxDets=100 (idx 2)
+        p = precision[:, :, k, 0, 2]
+        p = p[p > -1]
+        ap = float(p.mean()) if p.size else 0.0
+        out[cats[cat_id]] = ap
+    return out
+
+
+# =============================================================================
+# Report writers
+# =============================================================================
+
+def write_json(out_path: Path,
+               cfg: Config,
+               results: Sequence[BackendResult],
+               system_info: Mapping[str, Any]) -> None:
+    payload = {
+        "config": {k: (str(v) if isinstance(v, Path) else v)
+                   for k, v in asdict(cfg).items()},
+        "system_info": dict(system_info),
+        "backends": {
+            r.name: {
+                "model_path": r.model_path,
+                "metrics": r.metrics,
+                "per_image": [asdict(p) for p in r.per_image],
+            }
+            for r in results
         },
-        'system_info': system_info,
-        'pytorch_baseline': {},
-        'executorch_models': [],
     }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2, default=_json_default)
+    log.info("Wrote JSON: %s", out_path)
 
-    # ============================================================
-    # Evaluate PyTorch Baseline
-    # ============================================================
-    if (not args.skip_pytorch
-            and backends_cfg.get('include_pytorch_baseline', True)):
-        logger.info("=" * 80)
-        logger.info("EVALUATING PYTORCH BASELINE")
-        logger.info("=" * 80)
 
-        if pytorch_model_path.exists():
-            pytorch_model_size_mb = get_file_size_mb(str(pytorch_model_path))
-            logger.info(
-                f"PyTorch Model Size: {pytorch_model_size_mb:.2f} MB"
+def _json_default(o: Any) -> Any:
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, Path):
+        return str(o)
+    raise TypeError(f"Unserializable: {type(o)}")
+
+
+def write_xlsx(out_path: Path,
+               cfg: Config,
+               results: Sequence[BackendResult],
+               system_info: Mapping[str, Any]) -> None:
+    import pandas as pd  # local — keeps top-level import cost low
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        _summary_sheet(writer, results)
+        _per_class_sheet(writer, results)
+        _per_image_sheet(writer, results)
+        _system_info_sheet(writer, cfg, system_info)
+    log.info("Wrote XLSX: %s", out_path)
+
+
+def _summary_sheet(writer, results: Sequence[BackendResult]) -> None:
+    import pandas as pd
+    rows: list[dict[str, Any]] = []
+    for r in results:
+        m = r.metrics
+        coco = m.get("coco", {})
+        lat = m.get("latency", {})
+        rows.append({
+            "Backend": r.name,
+            "Model Path": r.model_path,
+            "Model Size (MB)": round(m.get("model_size_mb", 0.0), 3),
+            "# Images": int(m.get("num_images", 0)),
+            "# Predictions": int(m.get("num_predictions", 0)),
+            "mAP @[.5:.95]": round(coco.get("mAP_0.5_0.95", 0.0), 4),
+            "mAP @.5":       round(coco.get("mAP_0.5",       0.0), 4),
+            "mAP @.75":      round(coco.get("mAP_0.75",      0.0), 4),
+            "AR @100":       round(coco.get("AR_max100",     0.0), 4),
+            "Matched-IoU mean (≥0.5)":
+                round(m.get("mean_matched_iou_at_0.5", 0.0), 4),
+            "# images matched":
+                int(m.get("n_images_with_matches", 0)),
+            "Latency mean (ms)": round(lat.get("mean_ms", 0.0), 3),
+            "Latency p50 (ms)":  round(lat.get("p50_ms",  0.0), 3),
+            "Latency p95 (ms)":  round(lat.get("p95_ms",  0.0), 3),
+            "Latency p99 (ms)":  round(lat.get("p99_ms",  0.0), 3),
+            "Latency std (ms)":  round(lat.get("std_ms",  0.0), 3),
+        })
+    pd.DataFrame(rows).to_excel(writer, sheet_name="Summary", index=False)
+
+
+def _per_class_sheet(writer, results: Sequence[BackendResult]) -> None:
+    import pandas as pd
+    # union of class names across backends, in the order seen on first backend
+    if not results:
+        return
+    base_order = list(
+        results[0].metrics.get("per_class_AP_at_IoU_0.5_0.95", {}).keys())
+    extra = {
+        name
+        for r in results
+        for name in r.metrics.get("per_class_AP_at_IoU_0.5_0.95", {}).keys()
+    } - set(base_order)
+    class_order = base_order + sorted(extra)
+
+    table: dict[str, list[Any]] = {"Class": class_order}
+    for r in results:
+        d = r.metrics.get("per_class_AP_at_IoU_0.5_0.95", {})
+        table[f"{r.name} AP @[.5:.95]"] = [round(d.get(c, 0.0), 4)
+                                            for c in class_order]
+    pd.DataFrame(table).to_excel(
+        writer, sheet_name="Per-Class AP", index=False)
+
+
+def _per_image_sheet(writer, results: Sequence[BackendResult]) -> None:
+    import pandas as pd
+    if not results:
+        return
+    # Align rows across backends by (image_id, file_name).
+    index_map: dict[int, dict[str, Any]] = {}
+    for r in results:
+        for p in r.per_image:
+            row = index_map.setdefault(p.image_id, {
+                "image_id": p.image_id,
+                "file_name": p.file_name,
+                "width": p.width,
+                "height": p.height,
+            })
+            row[f"{r.name} latency_ms"] = round(p.inference_time_ms, 3)
+            row[f"{r.name} #det"] = p.num_detections
+            row[f"{r.name} matched_IoU"] = (
+                round(p.matched_mean_iou, 4)
+                if p.matched_mean_iou is not None else None
             )
-            try:
-                pt_model = load_pytorch_model(
-                    pytorch_model_path,
-                    qfgaohao_repo_path,
-                    num_classes=num_classes,
-                )
-                if pt_model is not None:
-                    pt_results = evaluate_pytorch_model(
-                        pt_model,
-                        dataloader,
-                        priors,
-                        box_utils,
-                        decoder_cfg,
-                        normalize_mean,
-                        normalize_std,
-                        num_classes=num_classes,
-                        max_samples=args.max_samples,
-                    )
-                    pt_metrics = calculate_detection_metrics(
-                        pt_results['predictions'], gt_coco
-                    )
-                    per_image_results = (
-                        generate_per_image_detection_results(
-                            pt_results['predictions'], gt_coco
-                        )
-                    )
-                    results['pytorch_baseline'] = {
-                        'model_path': str(pytorch_model_path),
-                        'model_size_mb': round(pytorch_model_size_mb, 2),
-                        'metrics': pt_metrics,
-                        'latency': pt_results['latency'],
-                        'per_image_results': per_image_results,
-                    }
-                    samples_evaluated = pt_results['samples_processed']
-                    if results['dataset']['samples_evaluated'] == 0:
-                        results['dataset']['samples_evaluated'] = (
-                            samples_evaluated
-                        )
-                    logger.info(
-                        f"PyTorch {primary_metric}: "
-                        f"{pt_metrics.get(primary_metric, 0.0):.4f}"
-                    )
-                    logger.info(
-                        f"PyTorch mAP@0.5: "
-                        f"{pt_metrics.get('mAP_0.5', 0.0):.4f}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Failed to evaluate PyTorch model: {e}",
-                    exc_info=True,
-                )
-        else:
-            logger.warning(
-                f"PyTorch model not found at {pytorch_model_path}"
-            )
+    rows = sorted(index_map.values(), key=lambda r: r["image_id"])
+    pd.DataFrame(rows).to_excel(writer, sheet_name="Per-Image", index=False)
 
-    # ============================================================
-    # Evaluate ExecuTorch Models
-    # ============================================================
-    if not args.skip_executorch:
-        et_model_entries = backends_cfg.get('executorch_models', [])
-        valid_et_entries = []
-        for entry in et_model_entries:
-            if 'pte_path' not in entry:
-                logger.warning(
-                    f"Skipping malformed executorch_models entry "
-                    f"(missing pte_path): {entry}"
-                )
-                continue
-            pte_path = _resolve_path(entry['pte_path'], toolkit_root)
-            if not pte_path.exists():
-                logger.warning(
-                    f"PTE not found for '{entry.get('name', '?')}': "
-                    f"{pte_path}; skipping this variant"
-                )
-                continue
-            valid_et_entries.append((entry, pte_path))
 
-        if valid_et_entries:
-            logger.info("=" * 80)
-            logger.info(
-                f"EVALUATING {len(valid_et_entries)} EXECUTORCH MODEL(S)"
-            )
-            logger.info("=" * 80)
+def _system_info_sheet(writer, cfg: Config,
+                       system_info: Mapping[str, Any]) -> None:
+    import pandas as pd
+    info_rows: list[dict[str, Any]] = []
+    for k, v in system_info.items():
+        info_rows.append({"Key": k, "Value": str(v)})
+    info_rows.append({"Key": "—" * 8, "Value": "—" * 8})
+    for k, v in asdict(cfg).items():
+        info_rows.append({"Key": f"config.{k}", "Value": str(v)})
+    pd.DataFrame(info_rows).to_excel(
+        writer, sheet_name="System Info", index=False)
 
-            for entry, pte_file in valid_et_entries:
-                variant_name = entry.get('name', pte_file.stem)
-                logger.info(f"\nEvaluating: {variant_name} ({pte_file.name})")
 
-                program = load_executorch_model(pte_file)
-                if program is None:
-                    continue
+# =============================================================================
+# System info
+# =============================================================================
 
-                try:
-                    et_results = evaluate_executorch_model(
-                        program,
-                        dataloader,
-                        priors,
-                        box_utils,
-                        decoder_cfg,
-                        normalize_mean,
-                        normalize_std,
-                        num_classes=num_classes,
-                        max_samples=args.max_samples,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to evaluate {variant_name}: {e}",
-                        exc_info=True,
-                    )
-                    continue
-
-                et_metrics = calculate_detection_metrics(
-                    et_results['predictions'], gt_coco
-                )
-
-                pte_size_mb = get_file_size_mb(str(pte_file))
-                ptd_file = pte_file.parent / (
-                    f"{pte_file.stem}_constants.ptd"
-                )
-                ptd_size_mb = (
-                    get_file_size_mb(str(ptd_file))
-                    if ptd_file.exists() else None
-                )
-                model_size_mb = pte_size_mb + (ptd_size_mb or 0)
-
-                samples_evaluated = et_results['samples_processed']
-                if results['dataset']['samples_evaluated'] == 0:
-                    results['dataset']['samples_evaluated'] = (
-                        samples_evaluated
-                    )
-
-                model_entry = {
-                    'name': variant_name,
-                    'is_baseline': bool(entry.get('is_baseline', False)),
-                    'model_path': str(pte_file),
-                    'model_size_mb': round(model_size_mb, 2),
-                    'pte_size_mb': round(pte_size_mb, 2),
-                    'metrics': et_metrics,
-                    'latency': et_results['latency'],
-                    'per_image_results': (
-                        generate_per_image_detection_results(
-                            et_results['predictions'], gt_coco
-                        )
-                    ),
-                }
-                if ptd_size_mb is not None:
-                    model_entry['ptd_size_mb'] = round(ptd_size_mb, 2)
-
-                results['executorch_models'].append(model_entry)
-
-                logger.info(
-                    f"{variant_name} {primary_metric}: "
-                    f"{et_metrics.get(primary_metric, 0.0):.4f}"
-                )
-                logger.info(
-                    f"{variant_name} mAP@0.5: "
-                    f"{et_metrics.get('mAP_0.5', 0.0):.4f}"
-                )
-                latency_stats = et_results['latency'] or {}
-                logger.info(
-                    f"{variant_name} Avg Latency: "
-                    f"{latency_stats.get('mean_ms', 0.0):.2f} ms"
-                )
-        else:
-            logger.warning(
-                "No valid ExecuTorch .pte variants found from config; "
-                "skipping ExecuTorch section"
-            )
-
-    # ============================================================
-    # Save Results
-    # ============================================================
-    consolidated_name = output_cfg.get(
-        'consolidated_json_name', 'mobile_net_v2_ssd_evaluation.json'
-    )
-    output_file = results_dir / consolidated_name
-    save_evaluation_results(results, output_file)
-
-    logger.info("=" * 80)
-    logger.info(f"Evaluation complete! Results saved to: {output_file}")
-    logger.info("=" * 80)
-
-    # ============================================================
-    # Generate HTML Report
-    # ============================================================
-    if args.generate_report and report_cfg.get('generate_html', True):
-        logger.info("\nGenerating HTML report...")
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+def collect_system_info() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "platform":       platform.platform(),
+        "python":         sys.version.split()[0],
+        "processor":      platform.processor() or "unknown",
+        "machine":        platform.machine(),
+    }
+    try:
+        import torch  # noqa: WPS433
+        info["torch"] = torch.__version__
+        info["torch_cuda_available"] = bool(torch.cuda.is_available())
+    except ImportError:
+        info["torch"] = "not installed"
+    try:
+        import tflite_runtime  # type: ignore  # noqa: WPS433
+        info["tflite_runtime"] = tflite_runtime.__version__  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
         try:
-            from evaluation.common.reporting.generate_html_report import (
-                generate_html_for_json,
-            )
-            if generate_html_for_json(output_file, output_dir=results_dir):
-                report_name = report_cfg.get(
-                    'html_name',
-                    'MobileNetV2-SSD-Lite_evaluation_report.html',
-                )
-                report_path = results_dir / report_name
-                logger.info(f"✓ HTML report generated: {report_path}")
-            else:
-                logger.warning("⚠ Failed to generate HTML report")
-        except ImportError as e:
-            logger.error(f"Failed to import HTML report generator: {e}")
+            import tensorflow as tf  # noqa: WPS433
+            info["tensorflow"] = tf.__version__
+        except ImportError:
+            info["tflite"] = "not installed"
+    try:
+        import pycocotools as pct  # noqa: WPS433
+        info["pycocotools"] = getattr(pct, "__version__", "unknown")
+    except ImportError:
+        info["pycocotools"] = "not installed"
+    info["timestamp_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return info
 
 
-if __name__ == '__main__':
-    main()
+# =============================================================================
+# CLI / main
+# =============================================================================
+
+log: Final[logging.Logger] = logging.getLogger("compare")
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--pt-weights", type=Path, required=True,
+                   help="Path to PyTorch .pth checkpoint (qfgaohao format)")
+    p.add_argument("--tflite", type=Path, required=True,
+                   help="Path to .tflite model (non-quantized)")
+    p.add_argument("--source-path", type=Path, required=True,
+                   help="Path to qfgaohao pytorch-ssd checkout "
+                        "(contains the 'vision' package)")
+    p.add_argument("--gt-json", type=Path, required=True,
+                   help="COCO-format ground truth JSON")
+    p.add_argument("--images-dir", type=Path, required=True,
+                   help="Directory containing image files referenced "
+                        "by gt-json file_names")
+    p.add_argument("--output-dir", type=Path,
+                   default=Path("output/comparison"),
+                   help="Output directory for JSON + XLSX (default: %(default)s)")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Evaluate only the first N images (debug)")
+    p.add_argument("--device", type=str, default="cpu",
+                   choices=("cpu", "cuda"),
+                   help="PyTorch device (default: cpu)")
+    p.add_argument("--warmup", type=int, default=5,
+                   help="Discard first N images from latency stats (default 5)")
+    p.add_argument("--score-threshold", type=float, default=0.01)
+    p.add_argument("--nms-iou-threshold", type=float, default=0.45)
+    p.add_argument("--max-detections", type=int, default=100)
+    p.add_argument("--candidate-size", type=int, default=200)
+    p.add_argument("--log-level", default="INFO",
+                   choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    return p
+
+
+def _setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    _setup_logging(args.log_level)
+
+    cfg = Config(
+        pt_weights=args.pt_weights.expanduser().resolve(),
+        tflite_path=args.tflite.expanduser().resolve(),
+        source_path=args.source_path.expanduser().resolve(),
+        gt_json=args.gt_json.expanduser().resolve(),
+        images_dir=args.images_dir.expanduser().resolve(),
+        output_dir=args.output_dir.expanduser().resolve(),
+        device=args.device,
+        limit=args.limit,
+        warmup_images=args.warmup,
+        score_threshold=args.score_threshold,
+        nms_iou_threshold=args.nms_iou_threshold,
+        max_detections_per_image=args.max_detections,
+        candidate_size=args.candidate_size,
+        log_level=args.log_level,
+    )
+    cfg.validate()
+    log.info("Resolved config:")
+    for k, v in asdict(cfg).items():
+        log.info("  %s = %s", k, v)
+
+    coco, images = load_coco_index(cfg.gt_json)
+    if cfg.limit is not None:
+        images = images[: cfg.limit]
+    log.info("Evaluating on %d image(s)", len(images))
+
+    backends: list[_BackendBase] = [
+        PyTorchBackend(cfg),
+        TFLiteBackend(cfg),
+    ]
+    results: list[BackendResult] = []
+    for b in backends:
+        try:
+            r = evaluate_backend(b, cfg, coco, images)
+            compute_metrics(r, coco, cfg)
+            results.append(r)
+        except Exception:
+            log.error("Backend %s failed:\n%s",
+                      b.name, traceback.format_exc())
+
+    system_info = collect_system_info()
+    write_json(cfg.output_dir / cfg.json_filename, cfg, results, system_info)
+    write_xlsx(cfg.output_dir / cfg.xlsx_filename, cfg, results, system_info)
+
+    # Console summary
+    log.info("\n%s\nCOMPARISON SUMMARY\n%s", "=" * 64, "=" * 64)
+    for r in results:
+        m = r.metrics
+        coco_m = m.get("coco", {})
+        lat = m.get("latency", {})
+        log.info(
+            "%-8s | size=%6.2f MB | mAP@.5:.95=%.4f | mAP@.5=%.4f "
+            "| mean=%6.2f ms | p95=%6.2f ms",
+            r.name,
+            m.get("model_size_mb", 0.0),
+            coco_m.get("mAP_0.5_0.95", 0.0),
+            coco_m.get("mAP_0.5", 0.0),
+            lat.get("mean_ms", 0.0),
+            lat.get("p95_ms", 0.0),
+        )
+    log.info("%s", "=" * 64)
+    return 0 if results else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
