@@ -1,13 +1,19 @@
-cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && \
-python -c "
-import json
-p = 'export/configs/vision/config_mobile_net_v2_ssd.json'
-c = json.load(open(p))
-c['export']['use_recipes'] = True
-json.dump(c, open(p, 'w'), indent=2)
-print('use_recipes=true')
-" && \
-source .venv/bin/activate && \
-export PYTHONPATH=\"$(realpath ../model_sources/MobileNetV2/src/pytorch/pytorch-ssd):$PYTHONPATH\" && \
-python export/vision/pytorch_to_executorch_vision.py \
-  export/configs/vision/config_mobile_net_v2_ssd.json --generate-report
+cd ~/Documents/projects/MetaExecuTorch && \
+source executorch-toolkit/.venv/bin/activate && \
+python scripts/compare_tflite_vs_pytorch.py \
+  --pt-weights model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth \
+  --tflite    model_sources/MobileNetV2/weights/model.tflite \
+  --source-path model_sources/MobileNetV2/src/pytorch/pytorch-ssd \
+  --gt-json   dataset/voc2012_as_coco/instances_voc2012_val.json \
+  --images-dir ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012/JPEGImages \
+  --output-dir output/comparison \
+  --limit 50
+
+
+  python scripts/compare_tflite_vs_pytorch.py \
+  --pt-weights model_sources/MobileNetV2/weights/mb2-ssd-lite-mp-0_686.pth \
+  --tflite    model_sources/MobileNetV2/weights/model.tflite \
+  --source-path model_sources/MobileNetV2/src/pytorch/pytorch-ssd \
+  --gt-json   dataset/voc2012_as_coco/instances_voc2012_val.json \
+  --images-dir ~/.cache/kagglehub/datasets/watanabe2362/voctrainval-11may2012/versions/1/VOCdevkit/VOC2012/JPEGImages \
+  --output-dir output/comparison
