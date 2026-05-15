@@ -39,7 +39,7 @@ Usage
         --coco-images      <path/to/val2017> \\
         --coco-annotations <path/to/instances_val2017.json> \\
         --output-xlsx      <path/to/out.xlsx> \\
-        --num-images       1000
+        --num-images       5000
 
 All paths default to the conventional locations under the MetaExecuTorch
 project tree; see :func:`parse_args`.
@@ -138,20 +138,17 @@ VOC_INDEX_NAMES: dict[int, str] = {
     20: "tvmonitor",
 }
 
-# COCO 80-class TFLite output index (0-79) -> COCO category_id.
-# Standard mapping for tf2_ssd_mobilenet_v2_coco17_ptq.tflite and the rest of
-# the Coral SSD MobileNet V2 family. Index N is the Nth entry in the standard
-# 80-class COCO label list (which skips the 10 unused ids in 1-90).
-TFLITE_COCO80_INDEX_TO_COCO_ID: tuple[int, ...] = (
-    1,  2,  3,  4,  5,  6,  7,  8,  9, 10,
-    11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-    22, 23, 24, 25, 27, 28, 31, 32, 33, 34,
-    35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-    46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
-    56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
-    67, 70, 72, 73, 74, 75, 76, 77, 78, 79,
-    80, 81, 82, 84, 85, 86, 87, 88, 89, 90,
-)
+# COCO 90-class TFLite output index (0-89) -> COCO category_id (1-90).
+#
+# TF Object Detection API SSD MobileNet V2 checkpoints (including
+# tf2_ssd_mobilenet_v2_coco17_ptq.tflite) use a 90-class output head that
+# mirrors COCO's gappy category_id space (1..90 with 10 "deleted" IDs:
+# 12, 26, 29, 30, 45, 66, 68, 69, 71, 83). The deleted positions simply have
+# no training signal and never produce high-confidence detections, but they
+# occupy a slot in the output tensor. The correct mapping is therefore
+# identity+1, NOT the 80-entry skip-the-gaps table used by many YOLO/Detectron
+# checkpoints.
+TFLITE_COCO90_INDEX_TO_COCO_ID: tuple[int, ...] = tuple(range(1, 91))
 
 # Subset of COCO category_ids that map to a VOC class (sorted for stable
 # COCOeval ordering).
@@ -217,6 +214,12 @@ class TFLiteSSDEvaluator:
         self._input_width = int(input_shape[2])
         self._input_dtype = self._input_details[0]["dtype"]
 
+        # Tracks the largest class index emitted by the postprocess op across
+        # every invocation. Logged after the evaluation run to verify the model
+        # is genuinely 90-class (TF Object Detection API convention) rather
+        # than 80-class (which would invalidate our identity+1 mapping).
+        self._max_class_idx_observed: int = -1
+
         logger.info(
             "TFLite model loaded: %s | input: %s %s",
             self.model_path.name,
@@ -247,7 +250,7 @@ class TFLiteSSDEvaluator:
         """Run one inference. Returns (boxes, classes, scores, count).
 
         ``boxes`` are in [ymin, xmin, ymax, xmax] normalized to [0, 1].
-        ``classes`` are 0-indexed into :data:`TFLITE_COCO80_INDEX_TO_COCO_ID`.
+        ``classes`` are 0-indexed into :data:`TFLITE_COCO90_INDEX_TO_COCO_ID`.
         """
         input_tensor = self._preprocess(pil_image)
         self._interpreter.set_tensor(
@@ -289,7 +292,7 @@ class TFLiteSSDEvaluator:
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
         detections: list[dict[str, Any]] = []
-        max_idx = len(TFLITE_COCO80_INDEX_TO_COCO_ID)
+        max_idx = len(TFLITE_COCO90_INDEX_TO_COCO_ID)
         for i in range(count):
             score = float(scores[i])
             if score < score_threshold:
@@ -297,7 +300,9 @@ class TFLiteSSDEvaluator:
             class_idx = int(classes[i])
             if not 0 <= class_idx < max_idx:
                 continue
-            category_id = TFLITE_COCO80_INDEX_TO_COCO_ID[class_idx]
+            if class_idx > self._max_class_idx_observed:
+                self._max_class_idx_observed = class_idx
+            category_id = TFLITE_COCO90_INDEX_TO_COCO_ID[class_idx]
 
             ymin, xmin, ymax, xmax = (float(v) for v in boxes[i])
             x1 = xmin * original_width
@@ -1181,6 +1186,20 @@ def run_comparison(
         logger.info("TFLite  avg latency: %.2f ms", tflite_mean)
         logger.info("PyTorch avg latency: %.2f ms", pytorch_mean)
 
+    # Sanity check: verify the TFLite model really used the full 90-class
+    # output head. If max_class_idx_observed <= 79 the model is likely 80-class
+    # and our identity+1 mapping is shifting predictions by up to 10 ids.
+    max_idx = tflite_eval._max_class_idx_observed  # noqa: SLF001 (diagnostic)
+    if max_idx < 0:
+        logger.warning("TFLite class-index check: no detections were emitted")
+    else:
+        verdict = "OK (>= 80, consistent with 90-class head)" if max_idx >= 80 \
+            else "SUSPICIOUS (< 80; model may be 80-class, mapping needs review)"
+        logger.info(
+            "TFLite class-index check: max observed = %d / 89  -- %s",
+            max_idx, verdict,
+        )
+
 
 # ---------------------------------------------------------------------------
 # CLI.
@@ -1249,8 +1268,12 @@ def parse_args() -> argparse.Namespace:
         help="Where to write the comparison xlsx.",
     )
     parser.add_argument(
-        "--num-images", type=int, default=1000,
-        help="Number of COCO val images to evaluate (sorted by image_id).",
+        "--num-images", type=int, default=5000,
+        help=(
+            "Number of COCO val2017 images to evaluate (sorted by image_id). "
+            "Default 5000 = full val split for statistically meaningful "
+            "validation against published reference numbers."
+        ),
     )
     parser.add_argument(
         "--score-threshold", type=float, default=0.01,
