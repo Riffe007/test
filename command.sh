@@ -1,4 +1,2 @@
-cd ~/Documents/projects/MetaExecuTorch/executorch-toolkit && pwd && ls export/vision/model_loader.py
-
-
-sed -n '810,913p' ~/Documents/projects/MetaExecuTorch/executorch-toolkit/export/vision/model_loader.py
+python -m export.vision.pytorch_to_executorch_vision \
+  export/configs/vision/config_mobile_net_v2_ssd.json --generate-report
