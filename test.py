@@ -345,7 +345,7 @@ class PyTorchSSDEvaluator:
         if str(self.repo_path) not in sys.path:
             sys.path.insert(0, str(self.repo_path))
 
-        from vision.ssd.mobilenetv2_ssd_lite import (  # type: ignore
+        from vision.ssd.mobilenet_v2_ssd_lite import (  # type: ignore
             create_mobilenetv2_ssd_lite,
             create_mobilenetv2_ssd_lite_predictor,
         )
