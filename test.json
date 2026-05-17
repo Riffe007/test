@@ -1,151 +1,176 @@
-#!/usr/bin/env python3
-"""Patch the MobileNetV2-SSD-Lite evaluation config so the qfgaohao repo and
-model-weight paths resolve correctly.
-
-Why this script exists
-----------------------
-``evaluate.py`` resolves relative config paths against the config file's own
-directory (``executorch-toolkit/export/configs/vision/``). Four paths in
-``config_mobile_net_v2_ssd.json`` are written as ``../model_sources/...`` --
-only one level up -- which lands in ``export/configs/model_sources/...``
-instead of the real location at the project root. The result is
-``ModuleNotFoundError: No module named 'vision'`` when the PyTorch / ExecuTorch
-backends import the SSD repo.
-
-This script rewrites exactly those four path values to absolute paths and
-leaves every other key -- including the working ``data_path`` and
-``gt_coco_json`` -- unchanged. It operates on the real file, so nothing is
-guessed or reconstructed, and it is idempotent: re-running it once the paths
-are correct is a no-op.
-
-Usage
------
-    python fix_config_paths.py [path/to/config_mobile_net_v2_ssd.json]
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-import shutil
-import sys
-from pathlib import Path
-from typing import Any, Optional
-
-# The qfgaohao pytorch-ssd repo root (the directory that contains the
-# ``vision`` package) and the model weights, confirmed on disk.
-REPO_PATH = (
-    "~/Documents/projects/MetaExecuTorch/model_sources/"
-    "MobileNetV2/src/pytorch/pytorch-ssd"
-)
-WEIGHTS_PATH = (
-    "~/Documents/projects/MetaExecuTorch/model_sources/"
-    "MobileNetV2/weights/mobile_net_v2_ssd.pth"
-)
-
-DEFAULT_CONFIG = "config_mobile_net_v2_ssd.json"
-
-# (section_path, key, corrected_value): section_path is the chain of dict keys
-# leading to the value to rewrite.
-CORRECTIONS: list[tuple[tuple[str, ...], str, str]] = [
-    (("model",), "model_path", WEIGHTS_PATH),
-    (("model",), "source_path", REPO_PATH),
-    (("model",), "model_sources_repo_path", REPO_PATH),
-    (("evaluation", "task"), "source_path", REPO_PATH),
-]
-
-
-def _get_section(
-    config: dict[str, Any], path: tuple[str, ...]
-) -> Optional[dict[str, Any]]:
-    """Return the nested dict at ``path``, or ``None`` if it is absent."""
-    node: Any = config
-    for key in path:
-        if not isinstance(node, dict) or key not in node:
-            return None
-        node = node[key]
-    return node if isinstance(node, dict) else None
-
-
-def patch_config(config_path: Path) -> int:
-    """Apply the path corrections to ``config_path`` in place.
-
-    Returns the number of values actually changed.
-    """
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-
-    changed = 0
-    for section_path, key, new_value in CORRECTIONS:
-        location = ".".join((*section_path, key))
-        section = _get_section(config, section_path)
-        if section is None:
-            print(f"  skip   {location}: section not found")
-            continue
-        old_value = section.get(key)
-        if old_value == new_value:
-            print(f"  ok     {location}: already correct")
-            continue
-        section[key] = new_value
-        print(f"  fixed  {location}")
-        print(f"           {old_value!r}")
-        print(f"        -> {new_value!r}")
-        changed += 1
-
-    if changed == 0:
-        print("\nNothing to change -- config already correct.")
-        return 0
-
-    backup = config_path.with_suffix(config_path.suffix + ".bak")
-    if backup.exists():
-        print(f"\nBackup already exists, not overwriting: {backup}")
-    else:
-        shutil.copy2(config_path, backup)
-        print(f"\nOriginal backed up to: {backup}")
-
-    config_path.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    print(f"Wrote {changed} correction(s) to: {config_path}")
-    return changed
-
-
-def verify_repo() -> None:
-    """Warn if the corrected repo path does not contain the vision package."""
-    vision_pkg = Path(REPO_PATH).expanduser() / "vision" / "__init__.py"
-    if vision_pkg.is_file():
-        print(f"Verified: qfgaohao 'vision' package found at {vision_pkg.parent}")
-    else:
-        print(
-            f"WARNING: expected the 'vision' package at {vision_pkg.parent} "
-            f"but it was not found -- double-check the repo location."
-        )
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Fix the model/repo paths in the MobileNetV2-SSD-Lite "
-        "evaluation config."
-    )
-    parser.add_argument(
-        "config",
-        nargs="?",
-        default=DEFAULT_CONFIG,
-        help=f"Path to the config JSON (default: {DEFAULT_CONFIG}).",
-    )
-    args = parser.parse_args(argv)
-
-    config_path = Path(args.config).expanduser()
-    if not config_path.is_file():
-        print(f"ERROR: config not found: {config_path}", file=sys.stderr)
-        return 2
-
-    print(f"Patching: {config_path}\n")
-    patch_config(config_path)
-    print()
-    verify_repo()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+{
+  "_comment": "Config for MobileNetV2-SSD-Lite (qfgaohao) end-to-end pipeline: PyTorch baseline ...",
+  "model": {
+    "model_path": "~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth",
+    "model_name": "mobile_net_v2_ssd",
+    "input_shape": [
+      1,
+      3,
+      300,
+      300
+    ],
+    "use_pretrained": true,
+    "normalize": true,
+    "normalize_mean": [
+      0.498,
+      0.498,
+      0.498
+    ],
+    "normalize_std": [
+      0.502,
+      0.502,
+      0.502
+    ],
+    "num_classes": 21,
+    "source_path": "~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2/src/pytorch/pytorch-ssd",
+    "model_sources_repo_path": "~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2/src/pytorch/pytorch-ssd"
+  },
+  "tflite_parity": {
+    "_comment": "OPTIONAL. If enabled, validates model.model_path against the TFLite source ...",
+    "enabled": false,
+    "tflite_source_path": "~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2/weights/mobile_net_v2_ssd.tflite",
+    "sample_image_path": "../dataset/samples/voc2012/parity_sample.jpg",
+    "report_path": "output/models/mobile_net_v2_ssd/tflite_parity_report.json",
+    "strict": true,
+    "max_abs_tolerance": 0.01,
+    "cosine_tolerance": 0.999
+  },
+  "export": {
+    "enabled": true,
+    "is_base": true,
+    "output_dir": "output/models/mobile_net_v2_ssd",
+    "output_name": "mobile_net_v2_ssd_executorch",
+    "dump_ptd": true,
+    "backend": "xnnpack",
+    "strict_export": false,
+    "save_metadata": true,
+    "benchmark": true,
+    "benchmark_iterations": 50,
+    "use_recipes": false,
+    "log_level": "INFO",
+    "enable_profiling": true,
+    "etdump_save_debug_buffer": false,
+    "etdump_debug_buffer_size": 2000000000,
+    "calibration_dir": "../dataset/samples/voc2012",
+    "save_pytorch_model": true
+  },
+  "quantization": [
+    {
+      "enabled": true,
+      "output_name": "mobile_net_v2_ssd_executorch_8a8w_pt",
+      "mode": "static",
+      "weight_dtype": "int8",
+      "activation_dtype": "int8",
+      "per_channel": true,
+      "calibration_samples": 25,
+      "calibration_dir": "../dataset/samples/voc2012"
+    },
+    {
+      "enabled": true,
+      "output_name": "mobile_net_v2_ssd_executorch_8a8w_pc",
+      "mode": "static",
+      "weight_dtype": "int8",
+      "activation_dtype": "int8",
+      "per_channel": true,
+      "calibration_samples": 25,
+      "calibration_dir": "../dataset/samples/voc2012"
+    },
+    {
+      "enabled": true,
+      "output_name": "mobile_net_v2_ssd_executorch_8da4w",
+      "mode": "dynamic",
+      "weight_dtype": "int4",
+      "activation_dtype": "int8",
+      "per_channel": true,
+      "calibration_samples": 25,
+      "calibration_dir": "../dataset/samples/voc2012"
+    }
+  ],
+  "evaluation": {
+    "enabled": true,
+    "task_type": "detection",
+    "primary_metric": "mAP_0.5_0.95",
+    "dataset": {
+      "data_path": "<<REPLACE WITH YOUR data_path - truncated in screenshots, see chat note>>",
+      "gt_coco_json": "<<REPLACE WITH YOUR gt_coco_json - truncated in screenshots, see chat note>>",
+      "split": "val",
+      "batch_size": 1,
+      "num_workers": 4,
+      "max_samples": null,
+      "class_subset": null,
+      "class_names": [
+        "BACKGROUND",
+        "aeroplane",
+        "bicycle",
+        "bird",
+        "boat",
+        "bottle",
+        "bus",
+        "car",
+        "cat",
+        "chair",
+        "cow",
+        "diningtable",
+        "dog",
+        "horse",
+        "motorbike",
+        "person",
+        "pottedplant",
+        "sheep",
+        "sofa",
+        "train",
+        "tvmonitor"
+      ]
+    },
+    "decoder": {
+      "image_size": 300,
+      "score_threshold": 0.01,
+      "nms_iou_threshold": 0.45,
+      "max_detections_per_image": 100,
+      "candidate_size": 200,
+      "center_variance": 0.1,
+      "size_variance": 0.2
+    },
+    "task": {
+      "source_path": "~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2/src/pytorch/pytorch-ssd"
+    },
+    "paths": {
+      "results_dir": "~/Documents/projects/MetaExecuTorch/output/results/mobile_net_v2_ssd"
+    },
+    "output": {
+      "save_per_image": true
+    },
+    "report": {
+      "save_predictions": true,
+      "save_consolidated_json": true,
+      "consolidated_json_name": "mobile_net_v2_ssd_evaluation.json",
+      "generate_html": true,
+      "html_name": "MobileNetV2-SSD-Lite_evaluation_report.html",
+      "include_per_image_table": true,
+      "include_metric_interpretations": true,
+      "include_system_info": true
+    },
+    "backends": {
+      "include_pytorch_baseline": true,
+      "executorch_models": [
+        {
+          "name": "executorch_fp32",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch.pte",
+          "is_baseline": true
+        },
+        {
+          "name": "executorch_int8_8a8w_pt",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8a8w_pt.pte"
+        },
+        {
+          "name": "executorch_int8_8a8w_pc",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8a8w_pc.pte"
+        },
+        {
+          "name": "executorch_int4_8da4w",
+          "pte_path": "output/models/mobile_net_v2_ssd/mobile_net_v2_ssd_executorch_8da4w.pte"
+        }
+      ]
+    }
+  }
+}
