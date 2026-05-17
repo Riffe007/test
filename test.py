@@ -46,6 +46,40 @@ so the HTML report populates reliably regardless of which reporter path runs:
 
 The ``# ── VERIFY ──`` items below are UNCHANGED and still require checking
 against the real qfgaohao repo, the ExecuTorch runtime, and the config schema.
+
+Revision 2 — graceful backend degradation
+------------------------------------------
+Fixes a crash: when the qfgaohao ``vision`` package could not be imported, the
+PyTorch backend was caught and skipped, but the ExecuTorch backend re-ran the
+same decoder load OUTSIDE a try/except and aborted the whole run. The
+ExecuTorch shared-decoder load is now guarded and degrades like any other
+optional backend. A new ``_ensure_qfgaohao_repo`` pre-check turns the opaque
+``No module named 'vision'`` failure into an actionable message naming the
+expected repo path. This does NOT resolve the underlying cause — the qfgaohao
+``pytorch-ssd`` repo path must still be set correctly in the config.
+
+Revision 3 — dataset-agnostic scoring (VOC and COCO)
+----------------------------------------------------
+Enables running the same VOC-trained model against either a VOC-format ground
+truth or COCO val2017 and getting comparable numbers. No new loader was needed:
+``VOCDetectionDataset`` already consumes a COCO-format JSON and resolves images
+by ``file_name``, so it handles both datasets as-is -- the switch is purely a
+config change (point ``data_path`` / ``gt_coco_json`` at the other dataset).
+
+The one real fix is in scoring scope. ``calculate_detection_metrics`` already
+accepted a ``class_subset``, but ``main`` never passed one, so COCOeval scored
+over every category in the ground truth. On a 20-category VOC ground truth that
+is correct; on COCO's 80-category ground truth it silently averages AP over 60
+categories the VOC model can never predict, collapsing the reported mAP. The
+PyTorch and ExecuTorch call sites now pass ``class_subset=MODEL_COCO_CATEGORY_IDS``
+(the 20 ids the model can predict). This is unconditional and correct for both
+datasets -- a no-op for VOC, essential for COCO. The TFLite call site is left
+unrestricted because that baseline is a separate COCO-90 model.
+
+Note: the per-image GT counts in ``generate_per_image_detection_results`` are
+NOT category-restricted, so on a COCO run the per-image table will count all
+ground-truth objects, including non-VOC categories. The headline mAP is correct;
+only that auxiliary table over-counts.
 ------------------------------------------------------------------------------
 """
 
@@ -139,6 +173,19 @@ VOC_INDEX_TO_COCO_ID: dict[int, int] = {
     19: 7,   # train
     20: 72,  # tvmonitor   -> tv
 }
+
+#: The COCO category ids the qfgaohao (VOC-trained) SSD can actually predict --
+#: i.e. the image of VOC_INDEX_TO_COCO_ID. Detection mAP for the PyTorch and
+#: ExecuTorch backends MUST be scored against exactly this category set, not the
+#: full set present in the ground truth. On a VOC-format ground truth the two
+#: are identical, so this is a no-op. On a COCO ground truth (instances_val2017,
+#: 80 categories) it is essential: without it COCOeval averages AP over all 80
+#: categories, the model scores 0 on the ~60 it cannot predict, and the reported
+#: mAP collapses into a category-space artifact rather than a real result. With
+#: it, a VOC run and a COCO run score the same 20 categories and are comparable.
+MODEL_COCO_CATEGORY_IDS: tuple[int, ...] = tuple(
+    sorted(set(VOC_INDEX_TO_COCO_ID.values()))
+)
 
 #: COCO 90-class TFLite output index (0-89) -> COCO category_id (1-90).
 #: TF Object Detection API SSD MobileNet V2 checkpoints use a 90-class output
@@ -511,6 +558,28 @@ def create_dataloader(
 # =============================================================================
 
 
+def _ensure_qfgaohao_repo(repo_path: Path) -> Path:
+    """Resolve the qfgaohao ``pytorch-ssd`` repo and put it on ``sys.path``.
+
+    The PyTorch and ExecuTorch backends both import that repo's ``vision``
+    package. This resolves ``repo_path``, verifies the package is actually
+    present, and prepends the repo to ``sys.path``. Failing here with a clear,
+    actionable message is far better than the opaque ``No module named
+    'vision'`` raised deep inside an ``import`` statement.
+    """
+    repo_path = Path(repo_path).resolve()
+    if not (repo_path / "vision").is_dir():
+        raise ModuleNotFoundError(
+            f"qfgaohao 'vision' package not found under repo_path={repo_path}. "
+            f"Point the config's model.model_sources_repo_path (or "
+            f"model.source_path) at the pytorch-ssd repo root — the directory "
+            f"that contains the 'vision/' package."
+        )
+    if str(repo_path) not in sys.path:
+        sys.path.insert(0, str(repo_path))
+    return repo_path
+
+
 def load_pytorch_model(
     model_path: Path,
     repo_path: Path,
@@ -522,9 +591,7 @@ def load_pytorch_model(
     # against your repo. The model is created with ``is_test=True`` so its
     # forward pass returns ``(confidences, locations)`` raw SSD head outputs.
     """
-    repo_path = Path(repo_path).resolve()
-    if str(repo_path) not in sys.path:
-        sys.path.insert(0, str(repo_path))
+    repo_path = _ensure_qfgaohao_repo(repo_path)
 
     from vision.ssd.mobilenet_v2_ssd_lite import (  # type: ignore
         create_mobilenetv2_ssd_lite,
@@ -577,9 +644,7 @@ def _load_priors_and_boxutils(repo_path: Path) -> tuple[torch.Tensor, Any]:
 
     # ── VERIFY ── qfgaohao module paths.
     """
-    repo_path = Path(repo_path).resolve()
-    if str(repo_path) not in sys.path:
-        sys.path.insert(0, str(repo_path))
+    repo_path = _ensure_qfgaohao_repo(repo_path)
 
     from vision.ssd.config import mobilenetv1_ssd_config as ssd_config  # type: ignore
     from vision.utils import box_utils  # type: ignore
@@ -1281,6 +1346,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 score_threshold=float(tflite_cfg.get("score_threshold", 0.01)),
                 max_samples=max_samples,
             )
+            # No class_subset here: the TFLite baseline is a COCO-90 model, so
+            # it is scored over the full ground-truth category space. Only the
+            # qfgaohao VOC model (PyTorch / ExecuTorch) is restricted.
             tflite_metrics = calculate_detection_metrics(
                 tflite_results["predictions"], gt_coco_json
             )
@@ -1320,7 +1388,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 norm_mean, norm_std, num_classes, max_samples,
             )
             pytorch_metrics = calculate_detection_metrics(
-                pytorch_results["predictions"], gt_coco_json
+                pytorch_results["predictions"], gt_coco_json,
+                class_subset=MODEL_COCO_CATEGORY_IDS,
             )
             results["pytorch_baseline"] = _build_backend_entry(
                 name="pytorch_baseline",
@@ -1347,8 +1416,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     executorch_variants = backends_cfg.get("executorch_models", [])
     if not args.skip_executorch and executorch_variants:
         if priors is None or box_utils is None:
-            # PyTorch was skipped but ExecuTorch shares the SSD decoder.
-            priors, box_utils = _load_priors_and_boxutils(repo_path)
+            # PyTorch was skipped or failed, but ExecuTorch shares the SSD
+            # decoder. A failure loading it here is non-fatal: skip ExecuTorch
+            # like any other optional backend instead of aborting the run.
+            try:
+                priors, box_utils = _load_priors_and_boxutils(repo_path)
+            except Exception as exc:
+                logger.error(
+                    "ExecuTorch backend cannot load the SSD decoder (%s); "
+                    "skipping.", exc,
+                )
+                executorch_variants = []
 
         for variant in executorch_variants:
             name = variant.get("name", "executorch")
@@ -1365,7 +1443,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     norm_mean, norm_std, num_classes, max_samples,
                 )
                 variant_metrics = calculate_detection_metrics(
-                    variant_results["predictions"], gt_coco_json
+                    variant_results["predictions"], gt_coco_json,
+                    class_subset=MODEL_COCO_CATEGORY_IDS,
                 )
 
                 ptd_path = pte_path.with_suffix(".ptd")
