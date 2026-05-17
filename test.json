@@ -1,5 +1,5 @@
 {
-  "_comment": "Config for MobileNetV2-SSD-Lite (qfgaohao) end-to-end pipeline: PyTorch baseline ...",
+  "_comment": "COCO variant. Same VOC-trained mobile_net_v2_ssd.pth as the VOC config, evaluated against COCO val2017. evaluate.py scores only the 20 COCO categories the model can predict (MODEL_COCO_CATEGORY_IDS), so this run is directly comparable to the VOC run.",
   "model": {
     "model_path": "~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2/weights/mobile_net_v2_ssd.pth",
     "model_name": "mobile_net_v2_ssd",
@@ -91,8 +91,8 @@
     "task_type": "detection",
     "primary_metric": "mAP_0.5_0.95",
     "dataset": {
-      "data_path": "<<REPLACE WITH YOUR data_path - truncated in screenshots, see chat note>>",
-      "gt_coco_json": "<<REPLACE WITH YOUR gt_coco_json - truncated in screenshots, see chat note>>",
+      "data_path": "~/Documents/projects/MetaExecuTorch/dataset/coco_val2017/val2017",
+      "gt_coco_json": "~/Documents/projects/MetaExecuTorch/dataset/coco_val2017/annotations/instances_val2017.json",
       "split": "val",
       "batch_size": 1,
       "num_workers": 4,
@@ -135,7 +135,7 @@
       "source_path": "~/Documents/projects/MetaExecuTorch/model_sources/MobileNetV2/src/pytorch/pytorch-ssd"
     },
     "paths": {
-      "results_dir": "~/Documents/projects/MetaExecuTorch/output/results/mobile_net_v2_ssd"
+      "results_dir": "~/Documents/projects/MetaExecuTorch/output/results/mobile_net_v2_ssd_coco"
     },
     "output": {
       "save_per_image": true
@@ -143,9 +143,9 @@
     "report": {
       "save_predictions": true,
       "save_consolidated_json": true,
-      "consolidated_json_name": "mobile_net_v2_ssd_evaluation.json",
+      "consolidated_json_name": "mobile_net_v2_ssd_coco_evaluation.json",
       "generate_html": true,
-      "html_name": "MobileNetV2-SSD-Lite_evaluation_report.html",
+      "html_name": "MobileNetV2-SSD-Lite_COCO_evaluation_report.html",
       "include_per_image_table": true,
       "include_metric_interpretations": true,
       "include_system_info": true
